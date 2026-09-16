@@ -1447,6 +1447,74 @@ class SfsBridgePlugin(NekoPluginBase):
         }
 
     @llm_tool(
+        name="control_sfs_camera",
+        description=(
+            "调整航天模拟器的视角。"
+            "想看清洗某个零件、看全整枚火箭、或画面里东西太小/太大时用它。"
+            "zoom_delta 是相对缩放（**正数拉远、负数拉近**，单位大致是米）；"
+            "distance 是绝对距离；x/y 是相机中心位置；rotation 是角度。"
+            "只传你想改的字段即可。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "zoom_delta": {
+                    "type": "number",
+                    "description": "相对缩放：正数拉远、负数拉近，例如 -20 拉近、30 拉远",
+                },
+                "distance": {"type": "number", "description": "绝对相机距离"},
+                "x": {"type": "number", "description": "相机中心 x"},
+                "y": {"type": "number", "description": "相机中心 y"},
+                "rotation": {"type": "number", "description": "相机角度（度）"},
+            },
+        },
+        timeout=30,
+    )
+    async def control_sfs_camera(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：调整视角。"""
+        payload: Dict[str, Any] = {}
+        for key in ("zoom_delta", "distance", "x", "y", "rotation"):
+            value = kwargs.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                payload[key] = float(value)
+        if not payload:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": (
+                        "需要至少给一个参数：zoom_delta（正数拉远/负数拉近）、"
+                        "distance、x、y、rotation。"
+                    ),
+                },
+                "is_error": True,
+            }
+
+        try:
+            result = await self._post_json("/camera", payload)
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"调整视角失败：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return {
+                "output": {"ok": False, "message": f"调整视角失败：{reason}"},
+                "is_error": True,
+            }
+
+        return {
+            "output": {
+                "ok": True,
+                "message": _as_text(detail.get("result")) or "已调整视角。",
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
         name="press_sfs_key",
         description=(
             "向航天模拟器发送按键（在游戏内注入，不需要游戏窗口在前台，"
