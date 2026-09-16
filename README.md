@@ -112,18 +112,38 @@ model = "qwen-vl-max"
 | `sfs_screenshot` | 入口 | 抓取画面并报告尺寸 |
 | `sfs_build` | 入口 | 读取火箭零件构成 |
 | `sfs_ui` | 入口 | 列出界面上可点击的按钮 |
-| `sfs_click` | 入口 | 点击界面（坐标或索引） |
+| `sfs_click` | 入口 | 点击界面（坐标或索引），等 3 秒并回读界面 |
 | `sfs_key` | 入口 | 发送按键 |
+| `sfs_parts` | 入口 | 列出可用零件名 |
+| `sfs_place` | 入口 | 把零件放到建造网格坐标 |
 | `see_sfs_screen` | LLM 工具 | **看画面**：「你看我造的火箭」 |
 | `get_sfs_status` | LLM 工具 | 读遥测：「我现在飞多高」 |
-| `control_sfs` | LLM 工具 | 飞行控制：「点火」「油门 80%」「分离一级」 |
+| `control_sfs` | LLM 工具 | 飞行控制：「点火」「油门 80%」「打开 RCS」「分离一级」 |
 | `get_rocket_design` | LLM 工具 | 读设计：「我这火箭用了什么零件」 |
 | `review_rocket_design` | LLM 工具 | **评审设计**：画面 + 遥测 + 零件一起分析 |
 | `list_sfs_ui` | LLM 工具 | **列出界面按钮** |
-| `click_sfs_ui` | LLM 工具 | **点击界面**：「开始游戏」「打开设置」 |
-| `press_sfs_key` | LLM 工具 | 发送按键：「按 Esc 返回」 |
+| `click_sfs_ui` | LLM 工具 | **点击界面**：「开始游戏」「打开设置」，自动等 3 秒回读新界面 |
+| `press_sfs_key` | LLM 工具 | 发送按键：「按 Esc 返回」「按住 Q 左转」 |
+| `list_sfs_parts` | LLM 工具 | **列出可用零件** |
+| `place_sfs_part` | LLM 工具 | **放置零件**：「在火箭下面加个引擎」 |
 
-支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、`stage`。
+支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、
+`stage`（空格：执行下一级）、`staging_program`（回车）、
+`rcs_on`、`rcs_off`、`rcs_toggle`。
+
+常用按键（`press_sfs_key` 的 `vk`）：空格=32 回车=13 Esc=27
+Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
+
+## SFS 默认操作方法
+
+| 操作 | 按键 |
+| --- | --- |
+| 向左 / 向右转向 | Q / E |
+| 平移与俯仰（需先开 RCS） | W / A / S / D |
+| 油门加大 / 减小 | Shift / Ctrl |
+| RCS 开关 | R |
+| 点火 / 执行下一级 | 空格 |
+| 分级控制程序 | 回车 |
 
 ## UI 操作是怎么做的
 
@@ -137,29 +157,62 @@ model = "qwen-vl-max"
 #4 Play  → (0.500, 0.481)
 ```
 
-### 点击是**游戏内事件注入**，不动你的鼠标
+### 点击是**游戏内输入派发**，不动你的鼠标
 
-模组直接触发按钮自己的 `clickEvent`（`UnityEvent<OnInputEndData>`），
-**不是**移动系统光标去点。因此：
+模组调用 SFS 自己的 `SFS.Input.InputManager`（`CheckMouseOverState` +
+`InputStart` / `TouchEnd`）来派发点击，**不是**移动系统光标去点。因此：
 
 - ✅ 点击期间鼠标指针**不会移动**，你可以同时用电脑做别的事
 - ✅ 不需要把游戏窗口切到前台
-- ✅ 实测点击主菜单 → 载入界面 → 返回主菜单，光标坐标全程不变
+- ✅ 实测点击主菜单 → 载入存档 → 建造场景，光标坐标全程不变
+- ✅ 命中判定由游戏自己做，比按坐标硬点准
 - ⚠️ 但点击**会真实改变游戏状态**（开始游戏、载入存档等），猫娘操作前请确认
 
-> 实现注记：`SFS.UI.Button` 以**显式接口实现**提供 `SFS.Input.I_Touchable.OnInputEnd`。
-> 这些方法在游戏运行时**无法**通过 `GetMethods()` 枚举到（离线反射同一个
-> `Assembly-CSharp.dll` 却可以）。因此模组走的是字段路径 `clickEvent.Invoke(...)`，
-> 并以 `OnInputEnd`、`onClick` 作为兜底。
+按键同理：`press_sfs_key` 走 Harmony 拦截 `UnityEngine.Input`，
+**也不会抢焦点**，游戏不必在前台。
+
+> 实现注记：早期版本直接 `Invoke` 按钮的 `clickEvent`，但按钮把逻辑接在
+> `onClick`（`OptionalDelegate`）上时会**返回成功却毫无效果**（实测 Esc 退出
+> 确认框的 Cancel 就是这种情况）。现已统一走 `InputManager`。
+
+### 点击后会自动等 3 秒并回读界面
+
+游戏切场景、加载存档**很慢**，立刻回读往往还是旧界面，
+模型就会误判成「点了没反应」。所以 `click_sfs_ui` 内部会：
+
+1. 派发点击
+2. **等约 3 秒**（`_POST_CLICK_WAIT`）
+3. 重新读取界面，把**点击后的新元素清单**一并放进返回值
+
+返回值里的 `after` 字段就是点击后的界面，直接看它就行，
+不需要自己再调一次 `list_sfs_ui`。
 
 ### 推荐流程
 
 1. 猫娘调 `list_sfs_ui` 拿到可点击元素清单（或 `see_sfs_screen` 看画面）
-2. 调 `click_sfs_ui` 按 `index` 点击（比坐标更准）
-3. 再调 `list_sfs_ui` 确认界面确实变了，然后决定下一步
+2. 调 `click_sfs_ui` 按 `index` 点击（比坐标更准），返回值里已带新界面
+3. 若新界面和预期不符，**再等一等或重新 list_sfs_ui 确认** ——
+   连续两三次都一样才能判定操作无效
 
 界面是**分级**的：点「Play」进入存档列表后，「Play / Rename / Delete」这些按钮
 在未选中存档时是置灰的，会被自动过滤掉 —— 先点存档卡片，它们才会出现。
+
+## 造火箭：零件是「放」上去的，不是拖上去的
+
+建造界面里零件必须从左侧菜单**拖**到火箭上，纯点击放不上去。
+所以插件提供了另一条通路：
+
+| 工具 | 作用 |
+| --- | --- |
+| `list_sfs_parts` | 列出可用零件名（先查这个，否则名字不合法会被拒绝） |
+| `place_sfs_part` | `place_sfs_part(name="Fuel Tank", x=0, y=8)` 直接放到网格坐标 |
+
+坐标 `x`/`y` 是建造网格坐标，`0` 是画面中心，向右 / 向上为正。
+这条路径**不需要拖动，也不移动鼠标**，模组直接构造游戏自己的
+`PartSave` → `Blueprint` → `BuildState.SpawnBlueprint`。
+
+> 零件名会先与模组读到的目录比对，**对不上的名字一律拒绝**，
+> 不会把未经验证的数据交给游戏内部。
 
 ## 关于「不会瞎编」
 

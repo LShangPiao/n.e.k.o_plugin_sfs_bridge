@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,21 +51,44 @@ _MAX_IMAGES_PER_CALL = 2
 # 操作界面的流程提示。随工具返回值一起交给模型，这样猫娘在调用时就能拿到，
 # 不依赖任何外部文档或角色设定。
 _UI_AGENT_GUIDE = (
-    "操作航天模拟器的流程："
-    "① 先 list_sfs_ui 拿可点击元素清单（或 see_sfs_screen 看画面）；"
-    "② 决定要点哪个；"
-    "③ 用 click_sfs_ui 点击，优先用 index（比坐标准）；"
-    "④ 再 list_sfs_ui / see_sfs_screen 确认界面确实变了。"
-    "坐标 x/y 是 0-1 的比例：左上角是 (0,0)，右下角是 (1,1)。"
-    "常用按键：Esc = press_sfs_key(vk=27)，回车 = press_sfs_key(vk=13)。"
-    "点击是游戏内事件注入，不会移动用户的鼠标，可以放心操作。"
-    "每次点击后界面可能变化，请重新列清单再决定下一步；"
-    "如果读不到元素，就改用 see_sfs_screen 看画面再按 x/y 点击。"
-    "查不到的东西如实说不知道，不要编造。"
+    "【看界面并操作】"
+    "① list_sfs_ui 拿可点击元素清单（或 see_sfs_screen 看画面）；"
+    "② 用 click_sfs_ui 点击，**优先用 index**（比坐标准）；"
+    "③ click_sfs_ui 返回里已经带了点击后的**新界面清单**，直接看那个就行。"
+    "❗游戏加载和切场景**很慢**，经常要几秒才有反应。"
+    "click_sfs_ui 内部已经帮你等了约 3 秒再回读界面——"
+    "所以界面没变化时**先别急着说「没反应」，再等一等或重新 list_sfs_ui 确认**，"
+    "连续两三次都一样，才能判定操作无效。"
+    "点 Play 进存档列表后，必须先点一张存档卡片，"
+    "Play/Rename/Delete 才会变成可用（未选中存档时它们是灰的，会被自动过滤掉）。"
+    "x/y 是 0-1 比例：左上角 (0,0)、右下角 (1,1)，与 list_sfs_ui 返回的坐标同一套。"
+    "点击是游戏内事件注入，**不会移动用户的鼠标**，可以放心点；"
+    "但它会真实改变游戏状态（开始游戏、载入存档等），动手前先想清楚。"
+    "【SFS 默认操作方法】"
+    "转向：Q 向左 / E 向右；"
+    "平移与俯仰：W/S/A/D（需先按 R 打开 RCS）；"
+    "油门：Shift 加大 / Ctrl 减小；"
+    "RCS 开关：R；"
+    "点火 / 执行下一级：空格；"
+    "分级控制程序：回车。"
+    "常用虚拟键码：Q=81 E=69 W=87 A=65 S=83 D=68 R=82 空格=32 回车=13 Shift=16 Ctrl=17 Esc=27。"
+    "按键同样是游戏内注入，游戏不需要在前台。"
+    "【造火箭（重要）】"
+    "建造界面里零件要从左侧菜单**拖**到火箭上，纯点击放不上去。"
+    "所以不要试图点击零件图标，改用 place_sfs_part(name=..., x=..., y=...) "
+    "直接把零件放到建造网格坐标上（不需要拖动、也不需要移动鼠标）。"
+    "先用 list_sfs_parts 拿到可用零件名。"
+    "【飞行控制】"
+    "优先用 control_sfs 直接设油门或分级 —— 它不走按键，最可靠。"
+    "查不到的东西如实说不知道，绝对不要编造飞行数据或界面内容。"
 )
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:21578"
 _USER_AGENT = "N.E.K.O-sfs-bridge-plugin/0.1"
+
+# 点击之后等多久再回读界面。
+# 游戏切场景/加载很慢，立刻回读往往还是旧界面，模型就会误判成「点了没反应」。
+_POST_CLICK_WAIT = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +158,24 @@ def _describe_state(state: Dict[str, Any]) -> str:
         parts.append("（当前不在飞行中，可能处于建造场景）")
 
     return "；".join(parts) if parts else "已连接游戏，但暂时读不到有效遥测。"
+
+
+def _summarize_ui(data: Dict[str, Any], limit: int = 20) -> str:
+    """把 /ui 返回的元素清单整理成可读文本。"""
+    elements = data.get("elements") or []
+    lines: List[str] = []
+    for item in elements[:limit]:
+        if not isinstance(item, dict):
+            continue
+        label = _as_text(item.get("label")) or "（无标签）"
+        index = item.get("index")
+        x = item.get("x")
+        y = item.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            lines.append(f"#{index} {label}  → ({x:.3f}, {y:.3f})")
+        else:
+            lines.append(f"#{index} {label}  → 无坐标")
+    return "\n".join(lines)
 
 
 def _describe_build(build: Dict[str, Any]) -> str:
@@ -507,14 +549,25 @@ class SfsBridgePlugin(NekoPluginBase):
         name="控制航天模拟器",
         description=(
             "向游戏发送控制指令。支持：set_throttle（设置油门 0-1）、"
-            "throttle_on、throttle_off、stage（分离下一级）。"
+            "throttle_on、throttle_off、stage（空格：执行下一级）、"
+            "staging_program（回车：分级控制程序）、rcs_on、rcs_off、rcs_toggle。"
+            "这些指令直接改游戏状态，不经过键盘。"
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["set_throttle", "throttle_on", "throttle_off", "stage"],
+                    "enum": [
+                        "set_throttle",
+                        "throttle_on",
+                        "throttle_off",
+                        "stage",
+                        "staging_program",
+                        "rcs_on",
+                        "rcs_off",
+                        "rcs_toggle",
+                    ],
                     "description": "指令名称",
                 },
                 "value": {
@@ -530,7 +583,16 @@ class SfsBridgePlugin(NekoPluginBase):
     async def sfs_command(self, command: str, value: float = 0.0, **_):
         """发送控制指令。"""
         command = _as_text(command)
-        allowed = {"set_throttle", "throttle_on", "throttle_off", "stage"}
+        allowed = {
+            "set_throttle",
+            "throttle_on",
+            "throttle_off",
+            "stage",
+            "staging_program",
+            "rcs_on",
+            "rcs_off",
+            "rcs_toggle",
+        }
         if command not in allowed:
             return Err(SdkError(f"不支持的指令：{command}"))
 
@@ -546,7 +608,11 @@ class SfsBridgePlugin(NekoPluginBase):
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
             "throttle_on": "已点火（油门开启）",
             "throttle_off": "已关闭油门",
-            "stage": "已触发分级",
+            "stage": "已执行下一级（分级）",
+            "staging_program": "已执行分级控制程序",
+            "rcs_on": "已打开 RCS",
+            "rcs_off": "已关闭 RCS",
+            "rcs_toggle": "已切换 RCS 开关",
         }
         return Ok({
             "ok": bool(_as_dict(result).get("ok", True)),
@@ -689,25 +755,121 @@ class SfsBridgePlugin(NekoPluginBase):
             reason = _as_text(detail.get("error")) or "未知原因"
             return Err(SdkError(f"点击失败：{reason}"))
 
+        # 游戏切界面慢，等一会儿再回读，顺便把新界面带回去
+        await asyncio.sleep(_POST_CLICK_WAIT)
+        after = ""
+        try:
+            data = await self._get_json("/ui")
+            after = _summarize_ui(data)
+        except Exception:  # pragma: no cover - 回读失败不影响点击本身
+            after = ""
+
         return Ok({
             "ok": True,
             "message": f"已点击{'元素 #' + str(index) if index >= 0 else ''}"
-                       f"{f'（{x:.2f}, {y:.2f}）' if index < 0 else ''}。",
+                       f"{f'（{x:.2f}, {y:.2f}）' if index < 0 else ''}，"
+                       f"等待 {_POST_CLICK_WAIT:.0f} 秒后界面如下。",
+            "after": after or "（点击后读不到界面元素）",
+            "guide": _UI_AGENT_GUIDE,
+        })
+
+    @plugin_entry(
+        id="sfs_parts",
+        name="列出可用零件",
+        description=(
+            "列出游戏内置的零件名称，用于在建造界面放置零件。"
+            "只有知道确切零件名才能用 sfs_place 放置。"
+        ),
+        timeout=40,
+        llm_result_fields=["count", "parts"],
+    )
+    async def sfs_parts(self, **_):
+        """列出可用零件。"""
+        try:
+            data = await self._get_json("/build_catalog")
+        except SdkError as exc:
+            return Ok({"count": 0, "parts": [], "message": str(exc)})
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("读取零件目录时出错")
+            return Err(SdkError(f"读取零件目录失败：{exc}"))
+
+        parts = data.get("parts") or []
+        return Ok({
+            "count": data.get("count", len(parts)),
+            "parts": parts,
+            "message": f"游戏内置 {len(parts)} 种零件。",
+            "guide": _UI_AGENT_GUIDE,
+        })
+
+    @plugin_entry(
+        id="sfs_place",
+        name="在指定位置放置零件",
+        description=(
+            "把指定名称的零件直接放到建造网格的坐标 (x, y) 上。"
+            "建造界面里零件本来必须拖动才能放上去，这个入口绕开拖动，"
+            "不需要移动鼠标，直接生成在指定位置。需要游戏处于建造场景。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "零件名称，如 Fuel Tank"},
+                "x": {"type": "number", "description": "建造网格横坐标，0 为画面中心"},
+                "y": {"type": "number", "description": "建造网格纵坐标，0 为画面中心"},
+            },
+            "required": ["name"],
+        },
+        timeout=40,
+        llm_result_fields=["ok", "message"],
+    )
+    async def sfs_place(
+        self, name: str, x: float = 0.0, y: float = 0.0, **_
+    ):
+        """在指定位置放置零件。"""
+        clean = _as_text(name)
+        if not clean:
+            return Err(SdkError("需要提供零件名称（可先用 list_sfs_parts 查询）。"))
+        try:
+            result = await self._post_json(
+                "/build_place", {"name": clean, "x": float(x), "y": float(y)}
+            )
+        except SdkError as exc:
+            return Err(exc)
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("放置零件时出错")
+            return Err(SdkError(f"放置零件失败：{exc}"))
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return Err(SdkError(
+                f"放置零件失败：{reason}"
+                "（请确认游戏处于建造场景，且零件名正确）"
+            ))
+
+        return Ok({
+            "ok": True,
+            "message": f"已把「{clean}」放到 ({x:.1f}, {y:.1f})。",
+            "placed": detail.get("placed", 0),
         })
 
     @plugin_entry(
         id="sfs_key",
         name="向游戏发送按键",
         description=(
-            "向游戏窗口发送一个按键。vk 为 Win32 虚拟键码，"
-            "例如 13=回车、27=Esc、32=空格、38=上、40=下。"
+            "向游戏发送一个按键。vk 为虚拟键码（与 UnityEngine.KeyCode 数值一致），"
+            "例如 13=回车、27=Esc、32=空格、81=Q、69=E、87=W、65=A、83=S、68=D、"
+            "82=R、16=Shift、17=Ctrl。"
+            "按键在游戏内部注入，不需要游戏窗口在前台，也不会打扰用户的其他操作。"
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "vk": {
                     "type": "integer",
-                    "description": "Win32 虚拟键码，例如 13=回车、27=Esc、32=空格",
+                    "description": (
+                        "虚拟键码。常用：空格=32 回车=13 Esc=27 "
+                        "Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17"
+                    ),
                 },
             },
             "required": ["vk"],
@@ -961,18 +1123,7 @@ class SfsBridgePlugin(NekoPluginBase):
             }
 
         elements = data.get("elements") or []
-        lines: List[str] = []
-        for item in elements[:20]:
-            if not isinstance(item, dict):
-                continue
-            label = _as_text(item.get("label")) or "（无标签）"
-            index = item.get("index")
-            x = item.get("x")
-            y = item.get("y")
-            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                lines.append(f"#{index} {label}  → ({x:.3f}, {y:.3f})")
-            else:
-                lines.append(f"#{index} {label}  → 无坐标")
+        summary = _summarize_ui(data)
 
         return {
             "output": {
@@ -980,8 +1131,8 @@ class SfsBridgePlugin(NekoPluginBase):
                 "count": data.get("count", len(elements)),
                 "elements": elements,
                 "summary": (
-                    "当前界面元素：\n" + "\n".join(lines)
-                    if lines
+                    "当前界面元素：\n" + summary
+                    if summary
                     else "当前界面没有读到可点击元素。"
                 ),
                 "guide": _UI_AGENT_GUIDE,
@@ -1049,10 +1200,136 @@ class SfsBridgePlugin(NekoPluginBase):
             }
 
         target = f"元素 #{index}" if index >= 0 else f"({x:.2f}, {y:.2f})"
+
+        # 关键：游戏切界面很慢。等一会儿再回读，把**点击后的新界面**一并返回，
+        # 模型就不用自己猜「到底有没有反应」，也不会因为太快看而误判。
+        await asyncio.sleep(_POST_CLICK_WAIT)
+        after = ""
+        after_count = 0
+        try:
+            data = await self._get_json("/ui")
+            after_count = data.get("count", 0)
+            after = _summarize_ui(data)
+        except Exception as exc:
+            after = f"（点击后读不到界面：{exc}；可用 see_sfs_screen 看画面确认）"
+
         return {
             "output": {
                 "ok": True,
-                "message": f"已点击 {target}。",
+                "message": f"已点击 {target}，等待 {_POST_CLICK_WAIT:.0f} 秒后界面如下。",
+                "after_count": after_count,
+                "after": after or "（当前界面没有读到可点击元素）",
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="list_sfs_parts",
+        description=(
+            "列出航天模拟器里可用的零件名称。"
+            "准备在建造界面搭火箭、或用户问「有哪些零件可以用」时先调用它，"
+            "拿到确切零件名后再用 place_sfs_part 放置。"
+        ),
+        parameters={"type": "object", "properties": {}},
+        timeout=40,
+    )
+    async def list_sfs_parts(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：列出可用零件。"""
+        try:
+            data = await self._get_json("/build_catalog")
+        except Exception as exc:
+            return {
+                "output": {
+                    "ok": False,
+                    "count": 0,
+                    "message": (
+                        f"读不到零件目录（{exc}）。请如实告诉用户游戏可能没有运行，"
+                        "不要编造零件名。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        parts = data.get("parts") or []
+        listing = "、".join(str(p) for p in parts[:60])
+        return {
+            "output": {
+                "ok": True,
+                "count": data.get("count", len(parts)),
+                "parts": parts,
+                "summary": f"可用零件共 {len(parts)} 种：{listing}",
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="place_sfs_part",
+        description=(
+            "在航天模拟器的建造界面，把指定零件直接放到坐标 (x, y) 上。"
+            "建造界面里零件本来必须从菜单拖到火箭上，纯点击放不上去；"
+            "这个工具绕开拖动，直接把零件生成在指定位置，也不会移动用户鼠标。"
+            "x、y 是建造网格坐标，0 是画面中心，向右/向上为正。"
+            "用户说「帮我加一个燃料罐」「在火箭下面装个引擎」时用它。"
+            "零件名要先通过 list_sfs_parts 确认。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "零件名称，需与 list_sfs_parts 返回的一致",
+                },
+                "x": {"type": "number", "description": "网格横坐标，0 为画面中心"},
+                "y": {"type": "number", "description": "网格纵坐标，0 为画面中心"},
+            },
+            "required": ["name"],
+        },
+        timeout=40,
+    )
+    async def place_sfs_part(
+        self, name: str, x: float = 0.0, y: float = 0.0, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """LLM 工具：在指定位置放置零件。"""
+        clean = _as_text(name)
+        if not clean:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": "需要提供零件名称；先用 list_sfs_parts 查一下有哪些零件。",
+                },
+                "is_error": True,
+            }
+        try:
+            result = await self._post_json(
+                "/build_place", {"name": clean, "x": float(x), "y": float(y)}
+            )
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"放置零件失败：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return {
+                "output": {
+                    "ok": False,
+                    "message": (
+                        f"放置零件失败：{reason}。"
+                        "请确认游戏处于建造场景（不是主菜单或飞行中），且零件名正确。"
+                    ),
+                },
+                "is_error": True,
+            }
+
+        return {
+            "output": {
+                "ok": True,
+                "message": f"已把「{clean}」放到 ({x:.1f}, {y:.1f})。",
+                "placed": detail.get("placed", 0),
                 "guide": _UI_AGENT_GUIDE,
             },
             "is_error": False,
@@ -1061,26 +1338,44 @@ class SfsBridgePlugin(NekoPluginBase):
     @llm_tool(
         name="press_sfs_key",
         description=(
-            "向航天模拟器发送按键。用于按 Esc 返回、回车确认、"
-            "空格加速时间等操作。vk 是 Win32 虚拟键码："
-            "13=回车、27=Esc、32=空格、37/38/39/40=方向键。"
+            "向航天模拟器发送按键（在游戏内注入，不需要游戏窗口在前台，"
+            "也不会打扰用户的其他操作）。"
+            "SFS 的默认操作方式："
+            "转向 Q(81) 左 / E(69) 右；"
+            "平移俯仰 W(87)/S(83)/A(65)/D(68)，需先按 R(82) 打开 RCS；"
+            "油门 Shift(16) 加大 / Ctrl(17) 减小；"
+            "RCS 开关 R(82)；点火或执行下一级 空格(32)；分级控制程序 回车(13)；"
+            "返回菜单 Esc(27)。"
+            "「按住」类操作（转向、油门）在本工具里保持约 0.12 秒，"
+            "时间不够可以重复调用几次。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "vk": {
                     "type": "integer",
-                    "description": "Win32 虚拟键码，例如 13=回车、27=Esc、32=空格",
+                    "description": (
+                        "虚拟键码：空格=32 回车=13 Esc=27 "
+                        "Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17"
+                    ),
+                },
+                "hold_ms": {
+                    "type": "integer",
+                    "description": "按住时长（毫秒），默认 120；转向时可调到 400-800",
                 },
             },
             "required": ["vk"],
         },
         timeout=30,
     )
-    async def press_sfs_key(self, vk: int, **kwargs: Any) -> Dict[str, Any]:
+    async def press_sfs_key(
+        self, vk: int, hold_ms: int = 120, **kwargs: Any
+    ) -> Dict[str, Any]:
         """LLM 工具：发送按键。"""
         try:
-            result = await self._post_json("/key", {"vk": int(vk)})
+            result = await self._post_json(
+                "/key", {"vk": int(vk), "hold_ms": int(hold_ms)}
+            )
         except Exception as exc:
             return {
                 "output": {"ok": False, "message": f"按键发送失败：{exc}"},
@@ -1091,28 +1386,47 @@ class SfsBridgePlugin(NekoPluginBase):
         if not _as_bool(detail.get("ok")):
             reason = _as_text(detail.get("error")) or "未知原因"
             return {
-                "output": {"ok": False, "message": f"按键发送失败：{reason}"},
+                "output": {
+                    "ok": False,
+                    "message": f"按键发送失败：{reason}",
+                },
                 "is_error": True,
             }
 
         return {
-            "output": {"ok": True, "message": f"已发送按键 {vk}。"},
+            "output": {
+                "ok": True,
+                "message": f"已发送按键 {vk}（按住 {hold_ms} 毫秒）。",
+                "guide": _UI_AGENT_GUIDE,
+            },
             "is_error": False,
         }
 
     @llm_tool(
         name="control_sfs",
         description=(
-            "控制航天模拟器（Spaceflight Simulator）。"
-            "当用户要求「点火」「关油门」「油门开到 80%」「分离一级」时调用。"
+            "直接控制航天模拟器（Spaceflight Simulator），不走按键，最可靠。"
+            "当用户要求「点火」「关油门」「油门开到 80%」「分离一级」"
+            "「打开 RCS」时调用。"
             "这是会改变游戏状态的真实操作，调用前请确认用户意图明确。"
+            "注意：stage 只是执行下一级，跟空格键等价；"
+            "要转向或平移请改用 press_sfs_key 按住 Q/E/W/A/S/D。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["set_throttle", "throttle_on", "throttle_off", "stage"],
+                    "enum": [
+                        "set_throttle",
+                        "throttle_on",
+                        "throttle_off",
+                        "stage",
+                        "staging_program",
+                        "rcs_on",
+                        "rcs_off",
+                        "rcs_toggle",
+                    ],
                     "description": "要执行的指令",
                 },
                 "value": {
@@ -1129,7 +1443,16 @@ class SfsBridgePlugin(NekoPluginBase):
     ) -> Dict[str, Any]:
         """LLM 工具：控制游戏。"""
         command = _as_text(command)
-        allowed = {"set_throttle", "throttle_on", "throttle_off", "stage"}
+        allowed = {
+            "set_throttle",
+            "throttle_on",
+            "throttle_off",
+            "stage",
+            "staging_program",
+            "rcs_on",
+            "rcs_off",
+            "rcs_toggle",
+        }
         if command not in allowed:
             return {
                 "output": {"ok": False, "message": f"不支持的指令：{command}"},
@@ -1148,10 +1471,18 @@ class SfsBridgePlugin(NekoPluginBase):
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
             "throttle_on": "已点火",
             "throttle_off": "已关闭油门",
-            "stage": "已触发分级",
+            "stage": "已执行下一级（分级）",
+            "staging_program": "已执行分级控制程序",
+            "rcs_on": "已打开 RCS",
+            "rcs_off": "已关闭 RCS",
+            "rcs_toggle": "已切换 RCS 开关",
         }
         return {
-            "output": {"ok": True, "message": labels.get(command, "指令已发送")},
+            "output": {
+                "ok": True,
+                "message": labels.get(command, "指令已发送"),
+                "guide": _UI_AGENT_GUIDE,
+            },
             "is_error": False,
         }
 
