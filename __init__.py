@@ -1,4 +1,4 @@
-# 航天模拟器助手插件 —— 连接 Spaceflight Simulator
+# 和猫娘一起造火箭（SFS）插件 —— 连接 Spaceflight Simulator
 # Copyright (C) 2026 星河拓航工作室 (Galaxy Exploration Studio)
 #
 # This program is free software: you can redistribute it and/or modify
@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""SFS Bridge Plugin（航天模拟器助手）
+"""SFS Bridge Plugin（和猫娘一起造火箭）
 
 连接 Spaceflight Simulator（航天模拟器），让猫娘：
 - 读取飞行遥测（高度、速度、油门、分级）

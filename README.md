@@ -1,4 +1,4 @@
-# 航天模拟器助手（SFS Bridge）
+# 和猫娘一起造火箭（SFS Bridge）
 
 <p align="center">
   由 <b>星河拓航工作室</b>（Galaxy Exploration Studio）开发与维护
@@ -56,7 +56,7 @@ pwsh -File build.ps1
 
 ### 2. 启动本插件
 
-在 N.E.K.O. 的插件页面刷新列表，启动「航天模拟器助手」。
+在 N.E.K.O. 的插件页面刷新列表，启动「和猫娘一起造火箭(SFS)」。
 
 就这两步。画面识别走 N.E.K.O. 自己的多模态模型，无需额外配置。
 

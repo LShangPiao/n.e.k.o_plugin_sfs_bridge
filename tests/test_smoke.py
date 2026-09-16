@@ -1,4 +1,4 @@
-# 航天模拟器助手插件测试
+# 和猫娘一起造火箭（SFS）插件测试
 # Copyright (C) 2026 星河拓航工作室 (Galaxy Exploration Studio)
 #
 # 本文件是 sfs_bridge 插件的一部分，以 GNU General Public License v3.0 许可发布。
