@@ -1,0 +1,55 @@
+[plugin]
+id = "sfs_bridge"
+name = "航天模拟器助手"
+description = "连接 Spaceflight Simulator（航天模拟器），让猫娘读取飞行遥测、查看游戏画面、操作游戏界面（主菜单、载入存档、建造菜单、设置）并对火箭设计给出建议。点击是游戏内事件注入，不会移动你的鼠标。需要先在游戏 Mods 目录安装配套的 SFS-Agent 模组。"
+short_description = "Bridge to Spaceflight Simulator: read telemetry, see the screen, control the UI, and comment on rocket designs."
+keywords = [
+    "航天模拟器", "SFS", "spaceflight", "火箭", "造火箭", "发射", "遥测", "看画面",
+    "游戏", "模拟器", "界面操作", "UI", "点按钮", "主菜单", "存档",
+    "rocket", "launch", "telemetry", "screen", "ui automation"
+]
+version = "0.1.0"
+type = "plugin"
+entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
+
+[plugin.author]
+name = "星河拓航工作室 (Galaxy Exploration Studio)"
+email = "1565873375@qq.com"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[sfs_bridge]
+# SFS-Agent 模组在游戏内监听的地址
+bridge_url = "http://127.0.0.1:21578"
+# 单次请求超时（秒）
+timeout_seconds = 12
+# 截图超时（秒），游戏内截图需要等一帧
+screenshot_timeout_seconds = 20
+# 发送给视觉模型前，画面的最大宽度（像素）
+screenshot_max_width = 1024
+# JPEG 压缩质量
+screenshot_jpeg_quality = 80
+# 是否把画面交给 N.E.K.O. 的视觉聊天模型识别
+vision_enabled = true
+# 视觉提示词：告诉模型这张图是什么、要看什么
+vision_prompt = "这是航天模拟器 Spaceflight Simulator 的当前游戏画面。请描述你看到的火箭结构、飞行阶段与环境，并结合用户的提问回答。"
+
+# ---------------------------------------------------------------------------
+# 可选：自带视觉模型
+# ---------------------------------------------------------------------------
+# 默认留空，此时画面由 N.E.K.O. 自身的「视觉聊天模型」识别
+# （设置 → API → 视觉聊天模型）。
+# 如果你的 N.E.K.O. 会话没有配置视觉模型，画面会被跳过；
+# 此时可在此填写任意 OpenAI 兼容的视觉接口，由插件自己把画面转成文字描述。
+[vlm_fallback]
+enabled = false
+base_url = ""
+api_key = ""
+model = ""
+max_tokens = 600

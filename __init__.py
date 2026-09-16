@@ -1,0 +1,1276 @@
+# 航天模拟器助手插件 —— 连接 Spaceflight Simulator
+# Copyright (C) 2026 星河拓航工作室 (Galaxy Exploration Studio)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""SFS Bridge Plugin（航天模拟器助手）
+
+连接 Spaceflight Simulator（航天模拟器），让猫娘：
+- 读取飞行遥测（高度、速度、油门、分级）
+- **查看游戏画面**（交给 N.E.K.O. 的视觉聊天模型识别）
+- 对火箭设计给出建议
+
+依赖：游戏内需安装配套的 SFS-Agent 模组（见 ../sfs-agent）。
+该模组在 127.0.0.1:21578 提供 HTTP 接口：/state、/command、/screenshot。
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from plugin.sdk.plugin import (
+    Err,
+    NekoPluginBase,
+    Ok,
+    SdkError,
+    lifecycle,
+    llm_tool,
+    neko_plugin,
+    plugin_entry,
+)
+
+# N.E.K.O. 对工具返回图片的限制（见 plugin/sdk/plugin/llm_tool.py）
+_MAX_BASE64_CHARS = 2 * 1024 * 1024
+_MAX_IMAGES_PER_CALL = 2
+
+# 操作界面的流程提示。随工具返回值一起交给模型，这样猫娘在调用时就能拿到，
+# 不依赖任何外部文档或角色设定。
+_UI_AGENT_GUIDE = (
+    "操作航天模拟器的流程："
+    "① 先 list_sfs_ui 拿可点击元素清单（或 see_sfs_screen 看画面）；"
+    "② 决定要点哪个；"
+    "③ 用 click_sfs_ui 点击，优先用 index（比坐标准）；"
+    "④ 再 list_sfs_ui / see_sfs_screen 确认界面确实变了。"
+    "坐标 x/y 是 0-1 的比例：左上角是 (0,0)，右下角是 (1,1)。"
+    "常用按键：Esc = press_sfs_key(vk=27)，回车 = press_sfs_key(vk=13)。"
+    "点击是游戏内事件注入，不会移动用户的鼠标，可以放心操作。"
+    "每次点击后界面可能变化，请重新列清单再决定下一步；"
+    "如果读不到元素，就改用 see_sfs_screen 看画面再按 x/y 点击。"
+    "查不到的东西如实说不知道，不要编造。"
+)
+
+DEFAULT_BRIDGE_URL = "http://127.0.0.1:21578"
+_USER_AGENT = "N.E.K.O-sfs-bridge-plugin/0.1"
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(number, maximum))
+
+
+def _describe_state(state: Dict[str, Any]) -> str:
+    """把遥测数据转成一句中文描述。"""
+    if not state.get("in_world"):
+        return "游戏当前不在世界场景中（可能停在主菜单或正在加载）。"
+
+    parts: List[str] = []
+    rocket = _as_text(state.get("rocket"))
+    if rocket:
+        parts.append(f"当前飞行器：{rocket}")
+    planet = _as_text(state.get("planet"))
+    if planet:
+        parts.append(f"所在天体：{planet}")
+
+    height = state.get("height")
+    if isinstance(height, (int, float)):
+        parts.append(f"高度 {height:.1f} 米")
+
+    speed = state.get("speed")
+    if isinstance(speed, (int, float)):
+        parts.append(f"速度 {speed:.1f} 米/秒")
+
+    throttle = state.get("throttle")
+    if isinstance(throttle, (int, float)):
+        parts.append(f"油门 {throttle * 100:.0f}%")
+
+    stage = state.get("stage")
+    if isinstance(stage, int) and stage >= 0:
+        parts.append(f"当前分级 {stage}")
+
+    mass = state.get("mass")
+    if isinstance(mass, (int, float)) and mass:
+        parts.append(f"质量 {mass:.1f} 吨")
+
+    if not state.get("flying"):
+        parts.append("（当前不在飞行中，可能处于建造场景）")
+
+    return "；".join(parts) if parts else "已连接游戏，但暂时读不到有效遥测。"
+
+
+def _describe_build(build: Dict[str, Any]) -> str:
+    """把火箭设计（零件构成）转成中文描述。"""
+    count = build.get("part_count")
+    if not isinstance(count, int) or count <= 0:
+        return (
+            "当前场景里没有读到火箭零件。"
+            "可能不在建造场景、火箭还没开始搭建，或者游戏没有运行。"
+        )
+
+    mode = _as_text(build.get("mode"))
+    mode_label = {
+        "build": "建造场景",
+        "flight": "飞行场景",
+        "idle": "空闲",
+    }.get(mode, mode or "未知场景")
+
+    parts: List[str] = [f"当前在{mode_label}，火箭共 {count} 个零件"]
+
+    mass = build.get("total_mass")
+    if isinstance(mass, (int, float)) and mass:
+        parts.append(f"总质量约 {mass:.2f} 吨")
+
+    stages = build.get("stage_count")
+    if isinstance(stages, int) and stages > 0:
+        parts.append(f"{stages} 个分级")
+
+    kinds = build.get("part_kinds") or []
+    if isinstance(kinds, list):
+        detail_items: List[str] = []
+        for item in kinds[:8]:
+            if not isinstance(item, dict):
+                continue
+            name = _as_text(item.get("name"))
+            number = item.get("count")
+            if name and isinstance(number, int):
+                detail_items.append(f"{name}×{number}")
+        if detail_items:
+            parts.append("主要零件：" + "、".join(detail_items))
+
+    return "；".join(parts) + "。"
+
+
+def _encode_for_vision(
+    png_bytes: bytes,
+    *,
+    max_width: int,
+    quality: int,
+) -> Tuple[Optional[str], str, str]:
+    """把 PNG 截图压缩成适合交给视觉模型的 JPEG base64。
+
+    返回 (base64 或 None, mime, 说明)。截图可能是 1080p 以上的 PNG，
+    原始体积常常超过 N.E.K.O. 对单张图片 2MB 的限制，因此必须缩放并把
+    质量逐级下调，直到满足限制。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        # 没有 Pillow 时，只有在原始体积够小的情况下才直接返回
+        encoded = base64.b64encode(png_bytes).decode("ascii")
+        if len(encoded) <= _MAX_BASE64_CHARS:
+            return encoded, "image/png", "未安装 Pillow，使用原始 PNG"
+        return None, "", "未安装 Pillow，且原始截图超出大小限制"
+
+    try:
+        image = Image.open(io.BytesIO(png_bytes))
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        if image.width > max_width:
+            ratio = max_width / float(image.width)
+            image = image.resize(
+                (max_width, max(1, int(image.height * ratio))),
+                Image.LANCZOS,
+            )
+
+        for q in (quality, 70, 60, 50, 40, 30):
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=q, optimize=True)
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            if len(encoded) <= _MAX_BASE64_CHARS:
+                return encoded, "image/jpeg", f"{image.width}x{image.height} q={q}"
+
+        return None, "", "压缩后仍超出大小限制"
+    except Exception as exc:  # pragma: no cover - 图像处理兜底
+        return None, "", f"图像处理失败：{exc}"
+
+
+# ---------------------------------------------------------------------------
+# 插件主体
+# ---------------------------------------------------------------------------
+
+@neko_plugin
+class SfsBridgePlugin(NekoPluginBase):
+    """航天模拟器桥接插件。"""
+
+    def __init__(self, ctx: Any):
+        super().__init__(ctx)
+        self.file_logger = self.enable_file_logging(log_level="INFO")
+        self.logger = self.file_logger
+
+        self._cfg: Dict[str, Any] = {}
+        self._bridge_url: str = DEFAULT_BRIDGE_URL
+        self._timeout: float = 12.0
+        self._shot_timeout: float = 20.0
+        self._max_width: int = 1024
+        self._jpeg_quality: int = 80
+        self._vision_enabled: bool = True
+        self._vision_prompt: str = ""
+        self._vlm: Dict[str, Any] = {}
+
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop: Any = None
+
+    # -- 基础设施 ---------------------------------------------------------
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """按事件循环缓存客户端（宿主会在不同 asyncio.run 中调用）。"""
+        import asyncio
+
+        try:
+            loop: Any = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover
+            loop = None
+
+        if self._client is None or self._client.is_closed or self._client_loop is not loop:
+            self._client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=self._timeout,
+                headers={"User-Agent": _USER_AGENT},
+            )
+            self._client_loop = loop
+        return self._client
+
+    async def _get_json(self, path: str) -> Dict[str, Any]:
+        """GET 一个 JSON 接口。"""
+        url = f"{self._bridge_url.rstrip('/')}{path}"
+        client = self._get_client()
+        try:
+            response = await client.get(url, timeout=self._timeout)
+        except httpx.TimeoutException as exc:
+            raise SdkError("连接游戏超时，请确认游戏正在运行。") from exc
+        except httpx.HTTPError as exc:
+            raise SdkError(
+                f"连不上游戏桥接服务（{self._bridge_url}）。"
+                f"请确认：1) 游戏正在运行；2) 已安装 SFS-Agent 模组；3) 已重启过游戏。"
+            ) from exc
+
+        if response.status_code >= 400:
+            raise SdkError(f"游戏桥接服务返回状态 {response.status_code}。")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise SdkError("游戏桥接服务返回的内容不是合法 JSON。") from exc
+
+    async def _post_command(self, name: str, value: float = 0.0) -> Dict[str, Any]:
+        """向游戏发送一条控制指令。"""
+        url = f"{self._bridge_url.rstrip('/')}/command"
+        client = self._get_client()
+        try:
+            response = await client.post(
+                url,
+                json={"name": name, "value": value},
+                timeout=self._timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise SdkError("发送指令超时。") from exc
+        except httpx.HTTPError as exc:
+            raise SdkError(f"无法连接游戏桥接服务：{exc}") from exc
+
+        if response.status_code >= 400:
+            raise SdkError(f"游戏桥接服务返回状态 {response.status_code}。")
+        try:
+            return response.json()
+        except ValueError:
+            return {"ok": True}
+
+    async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """向游戏桥接服务发送一个带 JSON 体的 POST 请求。"""
+        url = f"{self._bridge_url.rstrip('/')}{path}"
+        client = self._get_client()
+        try:
+            response = await client.post(url, json=payload, timeout=self._timeout)
+        except httpx.TimeoutException as exc:
+            raise SdkError("请求游戏超时。") from exc
+        except httpx.HTTPError as exc:
+            raise SdkError(f"无法连接游戏桥接服务：{exc}") from exc
+
+        if response.status_code >= 400:
+            raise SdkError(f"游戏桥接服务返回状态 {response.status_code}。")
+        try:
+            return response.json()
+        except ValueError:
+            return {"ok": True}
+
+    async def _capture_screen(self) -> Optional[bytes]:
+        """抓取一张游戏画面，失败返回 None。"""
+        url = f"{self._bridge_url.rstrip('/')}/screenshot"
+        client = self._get_client()
+        try:
+            response = await client.get(url, timeout=self._shot_timeout)
+        except httpx.HTTPError as exc:
+            self.logger.warning("截图失败: {}", exc)
+            return None
+
+        if response.status_code >= 400:
+            self.logger.warning("截图返回状态 {}", response.status_code)
+            return None
+        if not response.content:
+            return None
+        return response.content
+
+    async def _call_fallback_vlm(self, image_b64: str, mime: str, prompt: str) -> str:
+        """调用用户自配的视觉接口，把画面转成文字描述。"""
+        base_url = _as_text(self._vlm.get("base_url"))
+        model = _as_text(self._vlm.get("model"))
+        api_key = _as_text(self._vlm.get("api_key"))
+        if not base_url or not model:
+            return ""
+
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": model,
+            "max_tokens": _as_int(self._vlm.get("max_tokens"), 600, 64, 4096),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        client = self._get_client()
+        try:
+            response = await client.post(
+                url, json=payload, headers=headers, timeout=self._shot_timeout
+            )
+        except httpx.HTTPError as exc:
+            self.logger.warning("自带视觉模型调用失败: {}", exc)
+            return ""
+
+        if response.status_code >= 400:
+            self.logger.warning("自带视觉模型返回 {}", response.status_code)
+            return ""
+
+        try:
+            data = response.json()
+        except ValueError:
+            return ""
+
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        message = _as_dict(_as_dict(choices[0]).get("message"))
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            texts = [
+                _as_text(_as_dict(part).get("text"))
+                for part in content
+                if isinstance(part, dict)
+            ]
+            return " ".join(t for t in texts if t)
+        return ""
+
+    # -- 生命周期 ---------------------------------------------------------
+
+    @lifecycle(id="startup")
+    async def on_startup(self, **_):
+        try:
+            cfg = await self.config.dump(timeout=5.0)
+        except Exception as exc:  # pragma: no cover
+            self.logger.warning("读取配置失败，使用默认值: {}", exc)
+            cfg = {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        self._cfg = cfg
+
+        section = _as_dict(cfg.get("sfs_bridge"))
+        self._bridge_url = _as_text(section.get("bridge_url")) or DEFAULT_BRIDGE_URL
+
+        try:
+            self._timeout = float(section.get("timeout_seconds", 12))
+        except (TypeError, ValueError):
+            self._timeout = 12.0
+        self._timeout = min(max(self._timeout, 3.0), 60.0)
+
+        try:
+            self._shot_timeout = float(section.get("screenshot_timeout_seconds", 20))
+        except (TypeError, ValueError):
+            self._shot_timeout = 20.0
+        self._shot_timeout = min(max(self._shot_timeout, 5.0), 60.0)
+
+        self._max_width = _as_int(section.get("screenshot_max_width"), 1024, 320, 2048)
+        self._jpeg_quality = _as_int(section.get("screenshot_jpeg_quality"), 80, 30, 95)
+        self._vision_enabled = _as_bool(section.get("vision_enabled"), True)
+        self._vision_prompt = _as_text(section.get("vision_prompt")) or (
+            "这是航天模拟器 Spaceflight Simulator 的当前游戏画面。"
+            "请描述你看到的火箭结构、飞行阶段与环境。"
+        )
+
+        self._vlm = _as_dict(cfg.get("vlm_fallback"))
+
+        self.logger.info(
+            "SfsBridge 已就绪，桥接地址={} 视觉={} 自带模型={}",
+            self._bridge_url,
+            self._vision_enabled,
+            _as_bool(self._vlm.get("enabled")),
+        )
+        return Ok({
+            "status": "ready",
+            "bridge_url": self._bridge_url,
+            "vision_enabled": self._vision_enabled,
+            "vlm_fallback_enabled": _as_bool(self._vlm.get("enabled")),
+        })
+
+    @lifecycle(id="shutdown")
+    async def on_shutdown(self, **_):
+        client = self._client
+        self._client = None
+        self._client_loop = None
+        if client is not None and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception as exc:  # pragma: no cover
+                self.logger.debug("关闭客户端出错: {}", exc)
+        return Ok({"status": "stopped"})
+
+    # -- 插件入口 ---------------------------------------------------------
+
+    @plugin_entry(
+        id="sfs_status",
+        name="航天模拟器状态",
+        description="读取 Spaceflight Simulator 当前的飞行遥测：高度、速度、油门、分级、质量与所在天体。",
+        timeout=30,
+        llm_result_fields=["summary", "connected", "state"],
+    )
+    async def sfs_status(self, **_):
+        """读取游戏遥测。"""
+        try:
+            state = await self._get_json("/state")
+        except SdkError as exc:
+            return Ok({
+                "connected": False,
+                "summary": str(exc),
+                "state": {},
+            })
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("读取遥测时出错")
+            return Err(SdkError(f"读取遥测失败：{exc}"))
+
+        return Ok({
+            "connected": True,
+            "summary": _describe_state(state),
+            "state": state,
+        })
+
+    @plugin_entry(
+        id="sfs_command",
+        name="控制航天模拟器",
+        description=(
+            "向游戏发送控制指令。支持：set_throttle（设置油门 0-1）、"
+            "throttle_on、throttle_off、stage（分离下一级）。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["set_throttle", "throttle_on", "throttle_off", "stage"],
+                    "description": "指令名称",
+                },
+                "value": {
+                    "type": "number",
+                    "description": "set_throttle 时使用的油门值，范围 0-1",
+                },
+            },
+            "required": ["command"],
+        },
+        timeout=30,
+        llm_result_fields=["ok", "message"],
+    )
+    async def sfs_command(self, command: str, value: float = 0.0, **_):
+        """发送控制指令。"""
+        command = _as_text(command)
+        allowed = {"set_throttle", "throttle_on", "throttle_off", "stage"}
+        if command not in allowed:
+            return Err(SdkError(f"不支持的指令：{command}"))
+
+        try:
+            result = await self._post_command(command, float(value or 0.0))
+        except SdkError as exc:
+            return Err(exc)
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("发送指令时出错")
+            return Err(SdkError(f"发送指令失败：{exc}"))
+
+        labels = {
+            "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
+            "throttle_on": "已点火（油门开启）",
+            "throttle_off": "已关闭油门",
+            "stage": "已触发分级",
+        }
+        return Ok({
+            "ok": bool(_as_dict(result).get("ok", True)),
+            "command": command,
+            "message": labels.get(command, f"已发送 {command}"),
+        })
+
+    @plugin_entry(
+        id="sfs_screenshot",
+        name="截取游戏画面",
+        description="抓取一张 Spaceflight Simulator 的画面。返回图片信息与尺寸，供进一步识别。",
+        timeout=40,
+        llm_result_fields=["ok", "message"],
+    )
+    async def sfs_screenshot(self, **_):
+        """抓取画面（不解图，仅报告是否成功）。"""
+        png = await self._capture_screen()
+        if not png:
+            return Ok({
+                "ok": False,
+                "message": (
+                    "截图失败。请确认游戏正在运行、已安装 SFS-Agent 模组，"
+                    "并且窗口没有被最小化。"
+                ),
+            })
+
+        encoded, mime, note = _encode_for_vision(
+            png,
+            max_width=self._max_width,
+            quality=self._jpeg_quality,
+        )
+        if encoded is None:
+            return Ok({"ok": False, "message": f"画面已抓取但无法处理：{note}"})
+
+        return Ok({
+            "ok": True,
+            "mime": mime,
+            "bytes_png": len(png),
+            "encoded_chars": len(encoded),
+            "note": note,
+            "message": f"已截取画面（{note}）。",
+        })
+
+    @plugin_entry(
+        id="sfs_build",
+        name="读取火箭设计",
+        description=(
+            "读取当前火箭的零件构成、总质量与分级数，用于评审设计。"
+            "建造场景与飞行场景都支持。"
+        ),
+        timeout=30,
+        llm_result_fields=["connected", "mode", "part_count", "summary"],
+    )
+    async def sfs_build(self, **_):
+        """读取火箭设计（零件构成）。"""
+        try:
+            build = await self._get_json("/build")
+        except SdkError as exc:
+            return Ok({"connected": False, "summary": str(exc), "build": {}})
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("读取设计时出错")
+            return Err(SdkError(f"读取设计失败：{exc}"))
+
+        return Ok({
+            "connected": True,
+            "mode": _as_text(build.get("mode")),
+            "part_count": build.get("part_count", 0),
+            "summary": _describe_build(build),
+            "build": build,
+        })
+
+    @plugin_entry(
+        id="sfs_ui",
+        name="列出游戏界面元素",
+        description=(
+            "列出当前游戏界面上的可点击按钮及其归一化坐标，"
+            "用于精确操作主菜单、建造菜单等界面。"
+        ),
+        timeout=40,
+        llm_result_fields=["count", "elements", "summary"],
+    )
+    async def sfs_ui(self, **_):
+        """列出 UI 元素。"""
+        try:
+            data = await self._get_json("/ui")
+        except SdkError as exc:
+            return Ok({"count": 0, "elements": [], "summary": str(exc)})
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("枚举界面元素时出错")
+            return Err(SdkError(f"枚举界面失败：{exc}"))
+
+        elements = data.get("elements") or []
+        return Ok({
+            "count": data.get("count", len(elements)),
+            "elements": elements,
+            "summary": f"当前界面读到 {len(elements)} 个可点击元素。",
+            "guide": _UI_AGENT_GUIDE,
+        })
+
+    @plugin_entry(
+        id="sfs_click",
+        name="点击游戏界面",
+        description=(
+            "在游戏窗口的指定位置点击鼠标。x、y 为归一化坐标（0-1），"
+            "相对游戏窗口客户区左上角；也可以用 index 按界面元素索引点击。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "description": "横坐标 0-1（从左边算起）"},
+                "y": {"type": "number", "description": "纵坐标 0-1（从上边算起）"},
+                "index": {
+                    "type": "integer",
+                    "description": "按界面元素清单的索引点击（提供时优先于 x/y）",
+                },
+            },
+        },
+        timeout=30,
+        llm_result_fields=["ok", "message"],
+    )
+    async def sfs_click(
+        self, x: float = -1, y: float = -1, index: int = -1, **_
+    ):
+        """点击游戏界面。"""
+        try:
+            if isinstance(index, int) and index >= 0:
+                result = await self._post_json("/ui_click", {"index": index})
+            else:
+                if not (0 <= x <= 1 and 0 <= y <= 1):
+                    return Err(SdkError("需要提供 index，或 0-1 范围内的 x 与 y。"))
+                result = await self._post_json("/click", {"x": float(x), "y": float(y)})
+        except SdkError as exc:
+            return Err(exc)
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("点击时出错")
+            return Err(SdkError(f"点击失败：{exc}"))
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return Err(SdkError(f"点击失败：{reason}"))
+
+        return Ok({
+            "ok": True,
+            "message": f"已点击{'元素 #' + str(index) if index >= 0 else ''}"
+                       f"{f'（{x:.2f}, {y:.2f}）' if index < 0 else ''}。",
+        })
+
+    @plugin_entry(
+        id="sfs_key",
+        name="向游戏发送按键",
+        description=(
+            "向游戏窗口发送一个按键。vk 为 Win32 虚拟键码，"
+            "例如 13=回车、27=Esc、32=空格、38=上、40=下。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "vk": {
+                    "type": "integer",
+                    "description": "Win32 虚拟键码，例如 13=回车、27=Esc、32=空格",
+                },
+            },
+            "required": ["vk"],
+        },
+        timeout=30,
+        llm_result_fields=["ok", "message"],
+    )
+    async def sfs_key(self, vk: int, **_):
+        """向游戏发送按键。"""
+        try:
+            result = await self._post_json("/key", {"vk": int(vk)})
+        except SdkError as exc:
+            return Err(exc)
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("发送按键时出错")
+            return Err(SdkError(f"发送按键失败：{exc}"))
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return Err(SdkError(f"按键发送失败：{reason}"))
+
+        return Ok({"ok": True, "message": f"已发送按键 {vk}。"})
+
+    # -- LLM 工具 ---------------------------------------------------------
+
+    @llm_tool(
+        name="see_sfs_screen",
+        description=(
+            "查看航天模拟器（Spaceflight Simulator）当前画面。"
+            "当用户说「你看我造的火箭」「看看我现在飞到哪了」「看看这个画面」时调用。"
+            "图片会交给视觉模型识别，你应当根据看到的画面内容回答。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "用户关于这个画面的具体问题，留空则做整体描述",
+                },
+            },
+        },
+        timeout=60,
+    )
+    async def see_sfs_screen(self, question: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：把游戏画面交给视觉模型。"""
+        question = _as_text(question)
+
+        png = await self._capture_screen()
+        if not png:
+            return {
+                "output": {
+                    "ok": False,
+                    "connected": False,
+                    "message": (
+                        "没能抓到游戏画面。可能原因：游戏没有运行、"
+                        "没有安装 SFS-Agent 模组、或游戏窗口被最小化。"
+                        "请如实告诉用户画面不可用，不要猜测画面内容。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        encoded, mime, note = _encode_for_vision(
+            png,
+            max_width=self._max_width,
+            quality=self._jpeg_quality,
+        )
+        if encoded is None:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": f"画面已抓取但无法处理：{note}。请如实告知用户。",
+                },
+                "is_error": False,
+            }
+
+        prompt = question or self._vision_prompt
+        if not prompt:
+            prompt = "这是航天模拟器的游戏画面，请描述你看到的内容。"
+
+        # 1) 用户自配的视觉模型：直接把画面转成文字
+        if _as_bool(self._vlm.get("enabled")):
+            description = await self._call_fallback_vlm(encoded, mime, prompt)
+            if description:
+                return {
+                    "output": {
+                        "ok": True,
+                        "source": "自带视觉模型",
+                        "description": description,
+                        "message": description,
+                    },
+                    "is_error": False,
+                }
+            # 自带模型失败则继续走 N.E.K.O. 的视觉模型
+
+        # 2) N.E.K.O. 的视觉聊天模型：把图片放进返回信封
+        if not self._vision_enabled:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": (
+                        "插件当前关闭了画面识别（vision_enabled = false）。"
+                        "请如实告知用户，不要猜测画面内容。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        return {
+            "output": {
+                "ok": True,
+                "source": "N.E.K.O. 视觉模型",
+                "image_note": note,
+                "hint": (
+                    "画面已附在本次调用中，请依据图片内容回答。"
+                    "如果提示图片被跳过，说明当前会话没有配置视觉模型，"
+                    "请如实告知用户需要在 N.E.K.O. 设置中配置「视觉聊天模型」。"
+                ),
+            },
+            "images": [
+                {
+                    "data_b64": encoded,
+                    "mime": mime,
+                    "vision_prompt": prompt,
+                }
+            ],
+        }
+
+    @llm_tool(
+        name="get_sfs_status",
+        description=(
+            "读取航天模拟器（Spaceflight Simulator）的飞行遥测，"
+            "包括高度、速度、油门、分级与质量。"
+            "当用户问「我现在飞多高」「速度多少」时调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "unused": {
+                    "type": "string",
+                    "description": "占位参数，无需填写",
+                },
+            },
+        },
+        timeout=30,
+    )
+    async def get_sfs_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：读取遥测。"""
+        try:
+            state = await self._get_json("/state")
+        except Exception as exc:
+            return {
+                "output": {
+                    "connected": False,
+                    "summary": (
+                        f"读不到游戏遥测（{exc}）。请如实告诉用户游戏可能没有运行，"
+                        "不要编造飞行数据。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        return {
+            "output": {
+                "connected": True,
+                "summary": _describe_state(state),
+                "state": state,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="get_rocket_design",
+        description=(
+            "读取用户在航天模拟器里当前火箭的零件构成、总质量与分级数，用于分析设计。"
+            "当用户问「我这火箭用了什么零件」「一共多少零件」「总质量多少」时调用。"
+            "需要评价外观时请配合 see_sfs_screen 一起使用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "unused": {
+                    "type": "string",
+                    "description": "占位参数，无需填写",
+                },
+            },
+        },
+        timeout=30,
+    )
+    async def get_rocket_design(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：读取火箭设计。"""
+        try:
+            build = await self._get_json("/build")
+        except Exception as exc:
+            return {
+                "output": {
+                    "connected": False,
+                    "summary": (
+                        f"读不到火箭设计（{exc}）。请如实告诉用户游戏可能没有运行，"
+                        "不要编造零件或质量数据。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        return {
+            "output": {
+                "connected": True,
+                "mode": _as_text(build.get("mode")),
+                "part_count": build.get("part_count", 0),
+                "summary": _describe_build(build),
+                "build": build,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="list_sfs_ui",
+        description=(
+            "列出航天模拟器当前界面上的可点击按钮及坐标。"
+            "适合主菜单、建造菜单这类需要精确点击的场景。"
+            "拿不到清单时可以改用 see_sfs_screen 看画面后用 click_sfs_ui 点坐标。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "unused": {
+                    "type": "string",
+                    "description": "占位参数，无需填写",
+                },
+            },
+        },
+        timeout=40,
+    )
+    async def list_sfs_ui(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：列出界面元素。"""
+        try:
+            data = await self._get_json("/ui")
+        except Exception as exc:
+            return {
+                "output": {
+                    "ok": False,
+                    "count": 0,
+                    "message": (
+                        f"读不到界面元素（{exc}）。请如实告诉用户游戏可能没有运行，"
+                        "不要编造界面内容。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        elements = data.get("elements") or []
+        lines: List[str] = []
+        for item in elements[:20]:
+            if not isinstance(item, dict):
+                continue
+            label = _as_text(item.get("label")) or "（无标签）"
+            index = item.get("index")
+            x = item.get("x")
+            y = item.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                lines.append(f"#{index} {label}  → ({x:.3f}, {y:.3f})")
+            else:
+                lines.append(f"#{index} {label}  → 无坐标")
+
+        return {
+            "output": {
+                "ok": True,
+                "count": data.get("count", len(elements)),
+                "elements": elements,
+                "summary": (
+                    "当前界面元素：\n" + "\n".join(lines)
+                    if lines
+                    else "当前界面没有读到可点击元素。"
+                ),
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="click_sfs_ui",
+        description=(
+            "点击航天模拟器的界面。用于操作主菜单（开始游戏、载入存档、设置）、"
+            "建造菜单，以及任何需要点按钮的地方。"
+            "先用 see_sfs_screen 看清画面，或先用 list_sfs_ui 拿到元素清单，再决定点哪里。"
+            "x、y 是相对游戏窗口的归一化坐标（0-1，左上角为 0,0）。"
+            "这是会改变游戏状态的真实操作。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "横坐标 0-1，从左边算起",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "纵坐标 0-1，从上边算起",
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "list_sfs_ui 返回的元素索引，提供时优先于 x/y",
+                },
+            },
+        },
+        timeout=30,
+    )
+    async def click_sfs_ui(
+        self, x: float = -1, y: float = -1, index: int = -1, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """LLM 工具：点击界面。"""
+        try:
+            if isinstance(index, int) and index >= 0:
+                result = await self._post_json("/ui_click", {"index": index})
+            else:
+                if not (0 <= x <= 1 and 0 <= y <= 1):
+                    return {
+                        "output": {
+                            "ok": False,
+                            "message": "需要提供 index，或 0-1 范围内的 x 与 y。",
+                        },
+                        "is_error": True,
+                    }
+                result = await self._post_json("/click", {"x": float(x), "y": float(y)})
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"点击失败：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return {
+                "output": {"ok": False, "message": f"点击失败：{reason}"},
+                "is_error": True,
+            }
+
+        target = f"元素 #{index}" if index >= 0 else f"({x:.2f}, {y:.2f})"
+        return {
+            "output": {
+                "ok": True,
+                "message": f"已点击 {target}。",
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="press_sfs_key",
+        description=(
+            "向航天模拟器发送按键。用于按 Esc 返回、回车确认、"
+            "空格加速时间等操作。vk 是 Win32 虚拟键码："
+            "13=回车、27=Esc、32=空格、37/38/39/40=方向键。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "vk": {
+                    "type": "integer",
+                    "description": "Win32 虚拟键码，例如 13=回车、27=Esc、32=空格",
+                },
+            },
+            "required": ["vk"],
+        },
+        timeout=30,
+    )
+    async def press_sfs_key(self, vk: int, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：发送按键。"""
+        try:
+            result = await self._post_json("/key", {"vk": int(vk)})
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"按键发送失败：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return {
+                "output": {"ok": False, "message": f"按键发送失败：{reason}"},
+                "is_error": True,
+            }
+
+        return {
+            "output": {"ok": True, "message": f"已发送按键 {vk}。"},
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="control_sfs",
+        description=(
+            "控制航天模拟器（Spaceflight Simulator）。"
+            "当用户要求「点火」「关油门」「油门开到 80%」「分离一级」时调用。"
+            "这是会改变游戏状态的真实操作，调用前请确认用户意图明确。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["set_throttle", "throttle_on", "throttle_off", "stage"],
+                    "description": "要执行的指令",
+                },
+                "value": {
+                    "type": "number",
+                    "description": "set_throttle 时的油门值，0-1",
+                },
+            },
+            "required": ["command"],
+        },
+        timeout=30,
+    )
+    async def control_sfs(
+        self, command: str, value: float = 0.0, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """LLM 工具：控制游戏。"""
+        command = _as_text(command)
+        allowed = {"set_throttle", "throttle_on", "throttle_off", "stage"}
+        if command not in allowed:
+            return {
+                "output": {"ok": False, "message": f"不支持的指令：{command}"},
+                "is_error": True,
+            }
+
+        try:
+            await self._post_command(command, float(value or 0.0))
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"指令发送失败：{exc}"},
+                "is_error": True,
+            }
+
+        labels = {
+            "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
+            "throttle_on": "已点火",
+            "throttle_off": "已关闭油门",
+            "stage": "已触发分级",
+        }
+        return {
+            "output": {"ok": True, "message": labels.get(command, "指令已发送")},
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="review_rocket_design",
+        description=(
+            "评审用户在航天模拟器里正在建造或已经发射的火箭设计。"
+            "当用户问「你看我造的火箭怎么样」「这个设计合理吗」「帮我改进一下」时调用。"
+            "会同时抓取当前画面与飞行遥测，交给视觉模型分析。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "用户希望重点关注的方向，例如「推重比」「级间分离」「外观」",
+                },
+            },
+        },
+        timeout=60,
+    )
+    async def review_rocket_design(self, focus: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：评审火箭设计（画面 + 遥测）。"""
+        focus = _as_text(focus)
+
+        prompt = (
+            "这是航天模拟器 Spaceflight Simulator 的画面，用户正在设计或飞行一枚火箭。"
+            "请仔细观察画面中的火箭结构（分级、助推器、整流罩、发动机数量）与当前飞行状态，"
+            "给出具体的观察与改进建议。"
+        )
+        if focus:
+            prompt += f"用户特别关心：{focus}。"
+
+        # 遥测与零件构成（可能失败，不影响画面分析）
+        state_summary = ""
+        try:
+            state = await self._get_json("/state")
+            state_summary = _describe_state(state)
+        except Exception:
+            state_summary = "（未能读取遥测）"
+
+        try:
+            build = await self._get_json("/build")
+            state_summary += " " + _describe_build(build)
+        except Exception:
+            state_summary += " （未能读取零件构成）"
+
+        png = await self._capture_screen()
+        if not png:
+            return {
+                "output": {
+                    "ok": False,
+                    "telemetry": state_summary,
+                    "message": (
+                        "没能抓到游戏画面，因此无法评审设计。"
+                        "请如实告知用户画面不可用，不要凭空评价火箭外观。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        encoded, mime, note = _encode_for_vision(
+            png,
+            max_width=self._max_width,
+            quality=self._jpeg_quality,
+        )
+        if encoded is None:
+            return {
+                "output": {
+                    "ok": False,
+                    "telemetry": state_summary,
+                    "message": f"画面无法处理：{note}",
+                },
+                "is_error": False,
+            }
+
+        if _as_bool(self._vlm.get("enabled")):
+            description = await self._call_fallback_vlm(encoded, mime, prompt)
+            if description:
+                return {
+                    "output": {
+                        "ok": True,
+                        "source": "自带视觉模型",
+                        "telemetry": state_summary,
+                        "description": description,
+                        "message": description,
+                    },
+                    "is_error": False,
+                }
+
+        if not self._vision_enabled:
+            return {
+                "output": {
+                    "ok": False,
+                    "telemetry": state_summary,
+                    "message": "插件已关闭画面识别，无法评审设计。",
+                },
+                "is_error": False,
+            }
+
+        return {
+            "output": {
+                "ok": True,
+                "source": "N.E.K.O. 视觉模型",
+                "telemetry": state_summary,
+                "image_note": note,
+                "hint": (
+                    "画面已附在本次调用中。请结合上面的遥测数据一起分析火箭设计。"
+                    "如果提示图片被跳过，说明当前会话没有视觉模型，请如实告知用户。"
+                ),
+            },
+            "images": [
+                {
+                    "data_b64": encoded,
+                    "mime": mime,
+                    "vision_prompt": prompt,
+                }
+            ],
+        }
+
+
+__all__ = ["SfsBridgePlugin"]

@@ -1,0 +1,194 @@
+# 航天模拟器助手（SFS Bridge）
+
+<p align="center">
+  由 <b>星河拓航工作室</b>（Galaxy Exploration Studio）开发与维护
+</p>
+
+让猫娘接入 **Spaceflight Simulator（航天模拟器）**：读取飞行遥测、**查看游戏画面**、
+**操作游戏界面**（主菜单、载入存档、建造菜单、设置面板），并评审你的火箭设计。
+
+## 它是怎么工作的
+
+```
+猫娘（N.E.K.O. 的 LLM）
+   │  @llm_tool：see_sfs_screen / list_sfs_ui / click_sfs_ui ...
+   ▼
+sfs_bridge 插件（本插件）
+   │  HTTP  127.0.0.1:21578（仅本机回环）
+   ▼
+SFS-Agent 模组（游戏内 C# DLL）
+   │  反射 + Harmony
+   ▼
+Spaceflight Simulator
+```
+
+**必须先在游戏里安装配套模组**，否则插件连不上游戏。
+
+## 安装
+
+### 1. 安装游戏模组
+
+从 **SFS-Agent 模组仓库**的 Releases 页面下载 `SFS-Agent.dll`：
+
+> <https://github.com/LShangPiao/SFS-Agent/releases>
+
+按 SFS 的「一目录一模组」规范放入：
+
+```
+<Steam>\steamapps\common\Spaceflight Simulator\Spaceflight Simulator Game\Mods\SFS-Agent\SFS-Agent.dll
+```
+
+> ⚠️ 必须放在 `Mods\SFS-Agent\` 这个**子目录**里，并且文件名与目录名一致。
+> 不要直接平铺到 `Mods\` 根目录，也不要同时保留其他旧模组目录 ——
+> 两个模组会抢同一个端口，导致连上的不是你期望的那个。
+
+**然后重启游戏** —— 模组只在游戏启动时加载。
+
+模组源码与构建脚本在同一个仓库，可以自行编译（需要 Windows 自带的 `csc.exe`
+与已安装的游戏）：
+
+```powershell
+cd sfs-agent
+pwsh -File build.ps1
+```
+
+编译脚本会自动把产物部署到游戏的 `Mods\SFS-Agent\`。
+
+### 2. 启动本插件
+
+在 N.E.K.O. 的插件页面刷新列表，启动「航天模拟器助手」。
+
+### 3. 配置视觉模型（重要）
+
+`see_sfs_screen` 这类工具会把游戏画面交给 **N.E.K.O. 自身的视觉聊天模型**识别。
+
+请到 **N.E.K.O. 设置 → API → 视觉聊天模型**，填写：
+
+| 字段 | 说明 |
+| --- | --- |
+| 模型地址 | 视觉接口的 Base URL |
+| 模型名称 | 例如 `qwen3.7-plus`、`glm-4.6v-flash`、`gpt-5-chat-latest` |
+| API Key | 对应平台的密钥 |
+
+> 如果**没有**配置视觉模型：文字会话里图片会被跳过（模型会收到提示），
+> **实时语音会话完全无法显示图片**。此时插件会如实告知用户「看不到画面」，
+> 不会凭猜测描述。
+
+#### 可选：让插件自带一个视觉模型
+
+如果不想动 N.E.K.O. 全局设置，可以在插件配置里单独指定一个 OpenAI 兼容的
+视觉接口，由插件自己把画面转成文字描述：
+
+```toml
+[vlm_fallback]
+enabled = true
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-..."
+model = "qwen-vl-max"
+```
+
+开启后，画面会先交给这个模型转成文字，再交给对话模型。
+
+## 配置项
+
+`[sfs_bridge]` 段：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `bridge_url` | `http://127.0.0.1:21578` | 模组监听地址 |
+| `timeout_seconds` | `12` | 单次请求超时 |
+| `screenshot_timeout_seconds` | `20` | 截图超时（需等游戏渲染一帧） |
+| `screenshot_max_width` | `1024` | 送识别前缩放到的最大宽度 |
+| `screenshot_jpeg_quality` | `80` | JPEG 质量 |
+| `vision_enabled` | `true` | 是否把画面交给视觉模型 |
+| `vision_prompt` | 见模板 | 默认视觉提示词 |
+
+## 入口与工具
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `sfs_status` | 入口 | 读取飞行遥测 |
+| `sfs_command` | 入口 | 发送飞行控制指令 |
+| `sfs_screenshot` | 入口 | 抓取画面并报告尺寸 |
+| `sfs_build` | 入口 | 读取火箭零件构成 |
+| `sfs_ui` | 入口 | 列出界面上可点击的按钮 |
+| `sfs_click` | 入口 | 点击界面（坐标或索引） |
+| `sfs_key` | 入口 | 发送按键 |
+| `see_sfs_screen` | LLM 工具 | **看画面**：「你看我造的火箭」 |
+| `get_sfs_status` | LLM 工具 | 读遥测：「我现在飞多高」 |
+| `control_sfs` | LLM 工具 | 飞行控制：「点火」「油门 80%」「分离一级」 |
+| `get_rocket_design` | LLM 工具 | 读设计：「我这火箭用了什么零件」 |
+| `review_rocket_design` | LLM 工具 | **评审设计**：画面 + 遥测 + 零件一起分析 |
+| `list_sfs_ui` | LLM 工具 | **列出界面按钮** |
+| `click_sfs_ui` | LLM 工具 | **点击界面**：「开始游戏」「打开设置」 |
+| `press_sfs_key` | LLM 工具 | 发送按键：「按 Esc 返回」 |
+
+支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、`stage`。
+
+## UI 操作是怎么做的
+
+游戏启动后停在**主菜单**，那里还没有飞行器，所以界面操作是一条独立通路。
+
+模组用反射枚举当前界面上所有可点击的 `SFS.UI.Button`（透过 `buttonEnabled`
+过滤掉置灰的按钮），读出每个按钮的**文字标签**和**屏幕位置**，交给猫娘。
+猫娘只需要按索引点击，例如：
+
+```
+#4 Play  → (0.500, 0.481)
+```
+
+### 点击是**游戏内事件注入**，不动你的鼠标
+
+模组直接触发按钮自己的 `clickEvent`（`UnityEvent<OnInputEndData>`），
+**不是**移动系统光标去点。因此：
+
+- ✅ 点击期间鼠标指针**不会移动**，你可以同时用电脑做别的事
+- ✅ 不需要把游戏窗口切到前台
+- ✅ 实测点击主菜单 → 载入界面 → 返回主菜单，光标坐标全程不变
+- ⚠️ 但点击**会真实改变游戏状态**（开始游戏、载入存档等），猫娘操作前请确认
+
+> 实现注记：`SFS.UI.Button` 以**显式接口实现**提供 `SFS.Input.I_Touchable.OnInputEnd`。
+> 这些方法在游戏运行时**无法**通过 `GetMethods()` 枚举到（离线反射同一个
+> `Assembly-CSharp.dll` 却可以）。因此模组走的是字段路径 `clickEvent.Invoke(...)`，
+> 并以 `OnInputEnd`、`onClick` 作为兜底。
+
+### 推荐流程
+
+1. 猫娘调 `list_sfs_ui` 拿到可点击元素清单（或 `see_sfs_screen` 看画面）
+2. 调 `click_sfs_ui` 按 `index` 点击（比坐标更准）
+3. 再调 `list_sfs_ui` 确认界面确实变了，然后决定下一步
+
+界面是**分级**的：点「Play」进入存档列表后，「Play / Rename / Delete」这些按钮
+在未选中存档时是置灰的，会被自动过滤掉 —— 先点存档卡片，它们才会出现。
+
+## 关于「不会瞎编」
+
+航天模拟器里的数据如果读不到，插件**不会**让模型凭空回答：
+- 连不上游戏 → 明确返回「游戏可能没有运行，请如实告诉用户，不要编造飞行数据」
+- 抓不到画面 → 明确返回「画面不可用，不要猜测画面内容」
+- 没有视觉模型 → 明确返回「图片被跳过，请告知用户去配置视觉聊天模型」
+
+## 关于星河拓航工作室
+
+本插件由 **星河拓航工作室**（**Galaxy Exploration Studio**）开发与维护。
+
+星河拓航工作室是一个由来自五湖四海的航天爱好者组成的非正式线上航天科普组织，
+成员多为在校学生。我们希望通过有趣、可靠的方式，让更多人了解真实的航天。
+
+- 官方网站：<https://xhth.top/>
+- B 站主页：<https://space.bilibili.com/3546949529635067>
+
+欢迎航天爱好者加入交流，也欢迎反馈插件的问题与建议。
+
+## 说明
+
+- 桥接服务只监听 `127.0.0.1`，不对局域网或公网开放。
+- 模组只做只读遥测采集与少量指令，不会修改存档文件。
+- Spaceflight Simulator 为 Team Curiosity 开发的商业游戏，本项目与官方无关，
+  分发的是自制的第三方模组。
+
+## 许可证
+
+本项目采用 [GNU General Public License v3.0](LICENSE) 许可。
+
+Copyright (C) 2026 星河拓航工作室 (Galaxy Exploration Studio)

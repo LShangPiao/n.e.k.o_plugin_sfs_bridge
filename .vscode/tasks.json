@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "N.E.K.O: check sfs_bridge",
+      "type": "shell",
+      "command": "uv run neko-plugin check sfs_bridge",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: sync sfs_bridge",
+      "type": "shell",
+      "command": "uv run --with pip neko-plugin sync sfs_bridge --clean",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: check -r sfs_bridge",
+      "type": "shell",
+      "command": "uv run neko-plugin check -r sfs_bridge",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: build sfs_bridge",
+      "type": "shell",
+      "command": "uv run neko-plugin build sfs_bridge",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
