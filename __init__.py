@@ -75,9 +75,14 @@ _UI_AGENT_GUIDE = (
     "按键同样是游戏内注入，游戏不需要在前台。"
     "【造火箭（重要）】"
     "建造界面里零件要从左侧菜单**拖**到火箭上，纯点击放不上去。"
-    "所以不要试图点击零件图标，改用 place_sfs_part(name=..., x=..., y=...) "
-    "直接把零件放到建造网格坐标上（不需要拖动、也不需要移动鼠标）。"
-    "先用 list_sfs_parts 拿到可用零件名。"
+    "两条可用路径："
+    "① **加载现成蓝图**（最可靠）：list_sfs_blueprints 列出玩家存档里的蓝图，"
+    "load_sfs_blueprint 直接把整枚火箭生成到建造场景 —— "
+    "坐标、零件尺寸（N）、纹理（T）、分级全部由游戏自己解析，一定是正确可飞的。"
+    "用户说「搭一个 XX」「载入我的某枚火箭」时优先用这条。"
+    "② place_sfs_part：在指定网格坐标放**单个零件**。"
+    "注意单个零件是自己拼的，需要给对间距才连得成一体，"
+    "不如直接加载蓝图可靠。"
     "【飞行控制】"
     "优先用 control_sfs 直接设油门或分级 —— 它不走按键，最可靠。"
     "查不到的东西如实说不知道，绝对不要编造飞行数据或界面内容。"
@@ -1330,6 +1335,112 @@ class SfsBridgePlugin(NekoPluginBase):
                 "ok": True,
                 "message": f"已把「{clean}」放到 ({x:.1f}, {y:.1f})。",
                 "placed": detail.get("placed", 0),
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="list_sfs_blueprints",
+        description=(
+            "列出玩家在航天模拟器里保存过的**火箭蓝图**。"
+            "用户说「载入我存的那枚火箭」「看看我有哪些设计」「帮我搭 XX」时先调用它，"
+            "拿到确切名字后再用 load_sfs_blueprint 加载。"
+        ),
+        parameters={"type": "object", "properties": {}},
+        timeout=40,
+    )
+    async def list_sfs_blueprints(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：列出蓝图。"""
+        try:
+            data = await self._get_json("/blueprints")
+        except Exception as exc:
+            return {
+                "output": {
+                    "ok": False,
+                    "count": 0,
+                    "message": (
+                        f"读不到蓝图列表（{exc}）。请如实告诉用户游戏可能没有运行，"
+                        "不要编造火箭名字。"
+                    ),
+                },
+                "is_error": False,
+            }
+
+        items = data.get("blueprints") or []
+        listing = "、".join(str(x) for x in items[:60])
+        return {
+            "output": {
+                "ok": True,
+                "count": data.get("count", len(items)),
+                "blueprints": items,
+                "summary": f"共 {len(items)} 个蓝图：{listing}",
+                "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="load_sfs_blueprint",
+        description=(
+            "把玩家存档里的某个**火箭蓝图**直接加载到建造场景，整枚火箭一次性生成。"
+            "这是造火箭最可靠的路径：坐标、零件尺寸、纹理、分级全部由游戏自己解析，"
+            "因此一定是正确、可以飞的。"
+            "用户说「载入我的 XX 火箭」「帮我搭一个 XX」「用那个设计」时调用。"
+            "名字必须先通过 list_sfs_blueprints 确认。"
+            "注意：加载会**替换建造场景里当前的火箭**（如果是没保存的改动会丢失）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "蓝图名字，需与 list_sfs_blueprints 返回的一致",
+                },
+            },
+            "required": ["name"],
+        },
+        timeout=120,
+    )
+    async def load_sfs_blueprint(
+        self, name: str, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """LLM 工具：加载蓝图。"""
+        clean = _as_text(name)
+        if not clean:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": "需要提供蓝图名字；先用 list_sfs_blueprints 查一下有哪些。",
+                },
+                "is_error": True,
+            }
+        try:
+            result = await self._post_json("/blueprint_load", {"name": clean})
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"加载蓝图失败：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            reason = _as_text(detail.get("error")) or "未知原因"
+            return {
+                "output": {
+                    "ok": False,
+                    "message": (
+                        f"加载蓝图失败：{reason}。"
+                        "请确认游戏处于建造场景（不是主菜单或飞行中），且名字正确。"
+                    ),
+                },
+                "is_error": True,
+            }
+
+        return {
+            "output": {
+                "ok": True,
+                "message": _as_text(detail.get("result")) or f"已加载蓝图「{clean}」。",
                 "guide": _UI_AGENT_GUIDE,
             },
             "is_error": False,
