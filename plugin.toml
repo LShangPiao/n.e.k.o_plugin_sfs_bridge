@@ -13,7 +13,7 @@ type = "plugin"
 entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
 
 [plugin.author]
-name = "星河拓航工作室 (Galaxy Exploration Studio)"
+name = "星河拓航Studio"
 email = "1565873375@qq.com"
 
 [plugin.sdk]
