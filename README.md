@@ -225,6 +225,7 @@ Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
 
 - 官方网站：<https://xhth.top/>
 - B 站主页：<https://space.bilibili.com/3546949529635067>
+- 联系邮箱：<contact@xhth.top>
 
 欢迎航天爱好者加入交流，也欢迎反馈插件的问题与建议。
 

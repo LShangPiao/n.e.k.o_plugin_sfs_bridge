@@ -15,6 +15,7 @@ entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
 [plugin.author]
 name = "星河拓航Studio"
 email = "contact@xhth.top"
+url = "https://xhth.top/"
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
