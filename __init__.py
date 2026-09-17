@@ -56,7 +56,7 @@ _UI_AGENT_GUIDE = (
     "② 用 click_sfs_ui 点击，**优先用 index**（比坐标准）；"
     "③ click_sfs_ui 返回里已经带了点击后的**新界面清单**，直接看那个就行。"
     "❗游戏加载和切场景**很慢**，经常要几秒才有反应。"
-    "click_sfs_ui 内部已经帮你等了约 3 秒再回读界面——"
+    "click_sfs_ui 内部已经帮你等了一会儿再回读界面——"
     "所以界面没变化时**先别急着说「没反应」，再等一等或重新 list_sfs_ui 确认**，"
     "连续两三次都一样，才能判定操作无效。"
     "点 Play 进存档列表后，必须先点一张存档卡片，"
@@ -91,8 +91,9 @@ _UI_AGENT_GUIDE = (
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:21578"
 _USER_AGENT = "N.E.K.O-sfs-bridge-plugin/0.1"
 
-# 点击之后等多久再回读界面。
+# 点击之后等多久再回读界面（默认值）。
 # 游戏切场景/加载很慢，立刻回读往往还是旧界面，模型就会误判成「点了没反应」。
+# 用户可在 plugin.toml 的 post_click_wait_seconds 里调整。
 _POST_CLICK_WAIT = 3.0
 
 
@@ -485,6 +486,13 @@ class SfsBridgePlugin(NekoPluginBase):
             self._shot_timeout = 20.0
         self._shot_timeout = min(max(self._shot_timeout, 5.0), 60.0)
 
+        try:
+            self._click_wait = float(section.get("post_click_wait_seconds", _POST_CLICK_WAIT))
+        except (TypeError, ValueError):
+            self._click_wait = _POST_CLICK_WAIT
+        # 0.5 秒太短会读到旧界面，30 秒太久会让对话卡住
+        self._click_wait = min(max(self._click_wait, 0.5), 30.0)
+
         self._max_width = _as_int(section.get("screenshot_max_width"), 1024, 320, 2048)
         self._jpeg_quality = _as_int(section.get("screenshot_jpeg_quality"), 80, 30, 95)
         self._vision_enabled = _as_bool(section.get("vision_enabled"), True)
@@ -761,7 +769,7 @@ class SfsBridgePlugin(NekoPluginBase):
             return Err(SdkError(f"点击失败：{reason}"))
 
         # 游戏切界面慢，等一会儿再回读，顺便把新界面带回去
-        await asyncio.sleep(_POST_CLICK_WAIT)
+        await asyncio.sleep(self._click_wait)
         after = ""
         try:
             data = await self._get_json("/ui")
@@ -773,7 +781,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "ok": True,
             "message": f"已点击{'元素 #' + str(index) if index >= 0 else ''}"
                        f"{f'（{x:.2f}, {y:.2f}）' if index < 0 else ''}，"
-                       f"等待 {_POST_CLICK_WAIT:.0f} 秒后界面如下。",
+                       f"等待 {self._click_wait:.1f} 秒后界面如下。",
             "after": after or "（点击后读不到界面元素）",
             "guide": _UI_AGENT_GUIDE,
         })
@@ -1208,7 +1216,7 @@ class SfsBridgePlugin(NekoPluginBase):
 
         # 关键：游戏切界面很慢。等一会儿再回读，把**点击后的新界面**一并返回，
         # 模型就不用自己猜「到底有没有反应」，也不会因为太快看而误判。
-        await asyncio.sleep(_POST_CLICK_WAIT)
+        await asyncio.sleep(self._click_wait)
         after = ""
         after_count = 0
         try:
@@ -1221,7 +1229,7 @@ class SfsBridgePlugin(NekoPluginBase):
         return {
             "output": {
                 "ok": True,
-                "message": f"已点击 {target}，等待 {_POST_CLICK_WAIT:.0f} 秒后界面如下。",
+                "message": f"已点击 {target}，等待 {self._click_wait:.1f} 秒后界面如下。",
                 "after_count": after_count,
                 "after": after or "（当前界面没有读到可点击元素）",
                 "guide": _UI_AGENT_GUIDE,

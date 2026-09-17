@@ -7,6 +7,8 @@ auto_start = false
 bridge_url = "http://127.0.0.1:21578"
 # 单次请求超时（秒）
 timeout_seconds = 12
+# 点击后等多久再回读界面（秒），范围 0.5-30
+post_click_wait_seconds = 3.0
 # 截图超时（秒），游戏内截图需要等一帧
 screenshot_timeout_seconds = 20
 # 发送给视觉模型前，画面的最大宽度（像素）

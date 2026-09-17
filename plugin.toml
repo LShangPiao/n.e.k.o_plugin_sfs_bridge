@@ -8,7 +8,7 @@ keywords = [
     "游戏", "模拟器", "界面操作", "UI", "点按钮", "主菜单", "存档", "蓝图",
     "rocket", "launch", "telemetry", "screen", "ui automation", "blueprint"
 ]
-version = "0.1.0"
+version = "0.1.1"
 type = "plugin"
 entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
 
@@ -33,6 +33,10 @@ bridge_url = "http://127.0.0.1:21578"
 # 单次请求超时（秒），范围 3-60。
 # 调大适合机械硬盘加载慢的情况；调小会让「游戏没开」更快报错。
 timeout_seconds = 12
+# 点击后等多久再回读界面（秒），范围 0.5-30。
+# 游戏切场景/加载很慢，太短会读到旧界面、被误判成「点了没反应」；
+# 太长会让每次操作都卡住。机械硬盘或大型存档建议调大。
+post_click_wait_seconds = 3.0
 # 截图超时（秒），范围 5-120。
 # 游戏内截图需要等它渲染一帧，卡顿时可能要更久。
 screenshot_timeout_seconds = 20

@@ -72,6 +72,7 @@ pwsh -File build.ps1
 | --- | --- | --- |
 | `bridge_url` | `http://127.0.0.1:21578` | 模组监听地址 |
 | `timeout_seconds` | `12` | 单次请求超时 |
+| `post_click_wait_seconds` | `3.0` | 点击后等多久再回读界面（0.5-30 秒）。游戏加载慢就调大，免得把旧界面当成结果 |
 | `screenshot_timeout_seconds` | `20` | 截图超时（需等游戏渲染一帧） |
 | `screenshot_max_width` | `1024` | 送识别前缩放到的最大宽度 |
 | `screenshot_jpeg_quality` | `80` | JPEG 质量 |
@@ -87,7 +88,7 @@ pwsh -File build.ps1
 | `sfs_screenshot` | 入口 | 抓取画面并报告尺寸 |
 | `sfs_build` | 入口 | 读取火箭零件构成 |
 | `sfs_ui` | 入口 | 列出界面上可点击的按钮 |
-| `sfs_click` | 入口 | 点击界面（坐标或索引），等 3 秒并回读界面 |
+| `sfs_click` | 入口 | 点击界面（坐标或索引），等一会儿并回读界面（时长可配） |
 | `sfs_key` | 入口 | 发送按键 |
 | `sfs_parts` | 入口 | 列出可用零件名 |
 | `sfs_place` | 入口 | 把零件放到建造网格坐标 |
@@ -97,7 +98,7 @@ pwsh -File build.ps1
 | `get_rocket_design` | LLM 工具 | 读设计：「我这火箭用了什么零件」 |
 | `review_rocket_design` | LLM 工具 | **评审设计**：画面 + 遥测 + 零件一起分析 |
 | `list_sfs_ui` | LLM 工具 | **列出界面按钮** |
-| `click_sfs_ui` | LLM 工具 | **点击界面**：「开始游戏」「打开设置」，自动等 3 秒回读新界面 |
+| `click_sfs_ui` | LLM 工具 | **点击界面**：「开始游戏」「打开设置」，自动等待后回读新界面 |
 | `press_sfs_key` | LLM 工具 | 发送按键：「按 Esc 返回」「按住 Q 左转」 |
 | `list_sfs_parts` | LLM 工具 | **列出可用零件** |
 | `place_sfs_part` | LLM 工具 | **放置单个零件**：「在火箭下面加个引擎」 |
@@ -152,13 +153,13 @@ Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
 > `onClick`（`OptionalDelegate`）上时会**返回成功却毫无效果**（实测 Esc 退出
 > 确认框的 Cancel 就是这种情况）。现已统一走 `InputManager`。
 
-### 点击后会自动等 3 秒并回读界面
+### 点击后会自动等待并回读界面
 
 游戏切场景、加载存档**很慢**，立刻回读往往还是旧界面，
 模型就会误判成「点了没反应」。所以 `click_sfs_ui` 内部会：
 
 1. 派发点击
-2. **等约 3 秒**（`_POST_CLICK_WAIT`）
+2. **等一会儿**（时长见 `post_click_wait_seconds`，默认 3 秒）
 3. 重新读取界面，把**点击后的新元素清单**一并放进返回值
 
 返回值里的 `after` 字段就是点击后的界面，直接看它就行，
