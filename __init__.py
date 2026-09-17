@@ -53,7 +53,13 @@ _MAX_IMAGES_PER_CALL = 2
 _UI_AGENT_GUIDE = (
     "【看界面并操作】"
     "① list_sfs_ui 拿可点击元素清单（或 see_sfs_screen 看画面）；"
-    "② 用 click_sfs_ui 点击，**优先用 index**（比坐标准）；"
+    "② 用 click_sfs_ui 点击，**推荐直接报元素名字**（如 name=\"Play\"），"
+    "比记序号或坐标都可靠；也可以给 index 或 x/y。"
+    "**只有真的调用 click_sfs_ui 才会点下去** —— "
+    "只是嘴上说「我点了」游戏不会有任何变化。"
+    "click_sfs_ui 的返回值里有 delivered 字段："
+    "true 才表示真的送达了游戏，false 就是没发出去，不要当成点过了。"
+    "③ click_sfs_ui 返回里已经带了点击后的**新界面清单**，直接看那个就行。"
     "③ click_sfs_ui 返回里已经带了点击后的**新界面清单**，直接看那个就行。"
     "❗游戏加载和切场景**很慢**，经常要几秒才有反应。"
     "click_sfs_ui 内部已经帮你等了一会儿再回读界面——"
@@ -182,6 +188,42 @@ def _summarize_ui(data: Dict[str, Any], limit: int = 20) -> str:
         else:
             lines.append(f"#{index} {label}  → 无坐标")
     return "\n".join(lines)
+
+
+
+def _find_element(data: Dict[str, Any], want: str) -> Optional[Dict[str, Any]]:
+    """在 /ui 清单里按名字找元素。
+
+    匹配策略（从严到宽）：
+      1. 完全相等（忽略大小写）
+      2. 忽略大小写的子串包含
+      3. 去掉空格后再比一次
+
+    找不到返回 None；多个命中时取第一个。
+    """
+    elements = data.get("elements") or []
+    want_l = want.strip().lower()
+    want_compact = want_l.replace(" ", "")
+    if not want_l:
+        return None
+
+    fallback: Optional[Dict[str, Any]] = None
+    for item in elements:
+        if not isinstance(item, dict):
+            continue
+        label = _as_text(item.get("label") or "")
+        if not label:
+            continue
+        lab_l = label.strip().lower()
+        if lab_l == want_l:
+            return item
+        if want_l in lab_l or lab_l in want_l:
+            if fallback is None:
+                fallback = item
+        elif want_compact and want_compact in lab_l.replace(" ", ""):
+            if fallback is None:
+                fallback = item
+    return fallback
 
 
 def _describe_build(build: Dict[str, Any]) -> str:
@@ -1156,81 +1198,167 @@ class SfsBridgePlugin(NekoPluginBase):
     @llm_tool(
         name="click_sfs_ui",
         description=(
-            "点击航天模拟器的界面。用于操作主菜单（开始游戏、载入存档、设置）、"
-            "建造菜单，以及任何需要点按钮的地方。"
-            "先用 see_sfs_screen 看清画面，或先用 list_sfs_ui 拿到元素清单，再决定点哪里。"
-            "x、y 是相对游戏窗口的归一化坐标（0-1，左上角为 0,0）。"
-            "这是会改变游戏状态的真实操作。"
+            "【必须真正调用】点击航天模拟器的界面元素。"
+            "想操作游戏（开始游戏、载入存档、进建造、改设置）时，"
+            "**只有调用本工具才会真的点下去** —— 只是嘴上说「我点了」游戏不会有任何变化。"
+            "推荐用法：先 list_sfs_ui 看清有那些元素，再用 name 报元素名字点击"
+            "（比记序号或坐标都可靠），也可以给 index 或 x/y。"
+            "本工具会返回点击后的新界面清单，直接看返回值即可。"
+            "这是会改变游戏状态的真实操作，动手前先想清楚。"
         ),
         parameters={
             "type": "object",
             "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "要点击的元素名字（如 Play、Settings、My World 1），"
+                        "按名字模糊匹配，最推荐这个方式"
+                    ),
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "list_sfs_ui 返回的元素序号，提供时优先于 name 与 x/y",
+                },
                 "x": {
                     "type": "number",
-                    "description": "横坐标 0-1，从左边算起",
+                    "description": "横坐标 0-1，从左边算起（给不出名字或序号时才用）",
                 },
                 "y": {
                     "type": "number",
                     "description": "纵坐标 0-1，从上边算起",
-                },
-                "index": {
-                    "type": "integer",
-                    "description": "list_sfs_ui 返回的元素索引，提供时优先于 x/y",
                 },
             },
         },
         timeout=30,
     )
     async def click_sfs_ui(
-        self, x: float = -1, y: float = -1, index: int = -1, **kwargs: Any
+        self,
+        x: float = -1,
+        y: float = -1,
+        index: int = -1,
+        name: str = "",
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """LLM 工具：点击界面。"""
+        """LLM 工具：点击界面。
+
+        三种定位方式，优先级 index > name > x/y：
+          index —— list_sfs_ui 返回的序号
+          name  —— 元素名字（模糊匹配，最不容易出错）
+          x/y   —— 归一化坐标
+
+        无论成功失败，都会把结果写进插件日志（N.E.K.O. 日志里能看到），
+        返回的 message 也明确说明「发出去了没有」，避免模型自己猜。
+        """
+        target = ""
         try:
+            # ① 点之前先刷新一次清单 —— 免得拿旧清单戳新界面
+            before = ""
+            before_count = 0
+            try:
+                pre = await self._get_json("/ui")
+                before_count = int(pre.get("count", 0) or 0)
+                before = _summarize_ui(pre)
+            except Exception:
+                pre = {}
+
+            # ② 决定点哪里
             if isinstance(index, int) and index >= 0:
-                result = await self._post_json("/ui_click", {"index": index})
-            else:
-                if not (0 <= x <= 1 and 0 <= y <= 1):
+                target = f"元素 #{index}"
+                payload = {"index": index}
+                endpoint = "/ui_click"
+            elif isinstance(name, str) and name.strip():
+                # 按名字在当前清单里找
+                hit = _find_element(pre, name.strip())
+                if hit is None:
+                    msg = (
+                        f"没找到名字包含「{name}」的可点击元素。"
+                        f"当前界面共 {before_count} 个元素：{before}"
+                    )
+                    self.logger.info("[sfs_bridge] click_sfs_ui 未找到元素 name=%s", name)
                     return {
                         "output": {
                             "ok": False,
-                            "message": "需要提供 index，或 0-1 范围内的 x 与 y。",
+                            "message": msg,
+                            "before_count": before_count,
+                            "before": before,
                         },
                         "is_error": True,
                     }
-                result = await self._post_json("/click", {"x": float(x), "y": float(y)})
+                target = f"「{hit.get('label') or '(无标签)'}」#{hit.get('index')}"
+                payload = {"index": int(hit.get("index", 0))}
+                endpoint = "/ui_click"
+            elif 0 <= x <= 1 and 0 <= y <= 1:
+                target = f"({x:.2f}, {y:.2f})"
+                payload = {"x": float(x), "y": float(y)}
+                endpoint = "/click"
+            else:
+                msg = "需要提供 name、index，或 0-1 范围内的 x 与 y。"
+                self.logger.info("[sfs_bridge] click_sfs_ui 参数不足")
+                return {
+                    "output": {"ok": False, "message": msg},
+                    "is_error": True,
+                }
+
+            # ③ 真的发出去
+            result = await self._post_json(endpoint, payload)
         except Exception as exc:
+            # 失败也要留下痕迹，别让模型以为点过了
+            self.logger.warning("[sfs_bridge] click_sfs_ui 发送失败：%s", exc)
             return {
-                "output": {"ok": False, "message": f"点击失败：{exc}"},
+                "output": {
+                    "ok": False,
+                    "delivered": False,
+                    "message": f"点击失败（未送达游戏）：{exc}",
+                },
                 "is_error": True,
             }
 
         detail = _as_dict(result)
         if not _as_bool(detail.get("ok")):
             reason = _as_text(detail.get("error")) or "未知原因"
+            self.logger.warning(
+                "[sfs_bridge] click_sfs_ui 游戏侧拒绝 target=%s reason=%s", target, reason
+            )
             return {
-                "output": {"ok": False, "message": f"点击失败：{reason}"},
+                "output": {
+                    "ok": False,
+                    "delivered": False,
+                    "message": f"点击未送达：{reason}",
+                },
                 "is_error": True,
             }
 
-        target = f"元素 #{index}" if index >= 0 else f"({x:.2f}, {y:.2f})"
+        # 送达成功 —— 记一条，方便事后核对
+        self.logger.info("[sfs_bridge] click_sfs_ui 已送达 %s", target)
 
-        # 关键：游戏切界面很慢。等一会儿再回读，把**点击后的新界面**一并返回，
-        # 模型就不用自己猜「到底有没有反应」，也不会因为太快看而误判。
+        # ④ 等一会儿再回读新界面
         await asyncio.sleep(self._click_wait)
         after = ""
         after_count = 0
         try:
             data = await self._get_json("/ui")
-            after_count = data.get("count", 0)
+            after_count = int(data.get("count", 0) or 0)
             after = _summarize_ui(data)
         except Exception as exc:
             after = f"（点击后读不到界面：{exc}；可用 see_sfs_screen 看画面确认）"
 
+        changed = after_count != before_count
         return {
             "output": {
                 "ok": True,
-                "message": f"已点击 {target}，等待 {self._click_wait:.1f} 秒后界面如下。",
+                "delivered": True,
+                "message": (
+                    f"已点击 {target} 并确认送达游戏；"
+                    f"等待 {self._click_wait:.1f} 秒后界面"
+                    + ("已变化" if changed else "**没有变化**")
+                    + f"（{before_count} → {after_count} 个元素）。"
+                    + ("" if changed else "这不代表失败 —— 游戏加载可能更慢，"
+                       "可以再等一等或重新 list_sfs_ui 确认。")
+                ),
+                "before_count": before_count,
                 "after_count": after_count,
+                "changed": changed,
                 "after": after or "（当前界面没有读到可点击元素）",
                 "guide": _UI_AGENT_GUIDE,
             },
