@@ -79,6 +79,11 @@ _UI_AGENT_GUIDE = (
     "分级控制程序：回车。"
     "常用虚拟键码：Q=81 E=69 W=87 A=65 S=83 D=68 R=82 空格=32 回车=13 Shift=16 Ctrl=17 Esc=27。"
     "按键同样是游戏内注入，游戏不需要在前台。"
+    "【持续推力要按住，别脉冲式点】"
+    "RCS 平移（W/S/A/D）本质是持续推力：按一下就松，在高速下几乎推不出位移，"
+    "算不准该转多少度。正确做法是 —— "
+    "hold_sfs_key 按住 → get_sfs_status 看数据 → release_sfs_key 松开。"
+    "**用完务必松开**，不然会一直朝那个方向加速。"
     "【造火箭（重要）】"
     "建造界面里零件要从左侧菜单**拖**到火箭上，纯点击放不上去。"
     "两条可用路径："
@@ -1578,6 +1583,142 @@ class SfsBridgePlugin(NekoPluginBase):
                 "ok": True,
                 "message": _as_text(detail.get("result")) or f"已加载蓝图「{clean}」。",
                 "guide": _UI_AGENT_GUIDE,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="hold_sfs_key",
+        description=(
+            "【按住不放】按下某个键并**一直保持按住**，直到调用 release_sfs_key。"
+            "用于需要持续推力的操作 —— RCS 平移（W/A/S/D）就是典型："
+            "之前只有「按一下就松」，在高速飞行时脉冲式按键算不出该转多少度，"
+            "要么转不动要么转过头。现在可以："
+            "① hold_sfs_key 按住 W；② get_sfs_status 看数据；③ release_sfs_key 松开。"
+            "**用完一定要松开**，否则会一直推下去。"
+            "也可以给 hold_ms 让它自动松开，省一次调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "vk": {
+                    "type": "integer",
+                    "description": "虚拟键码：W=87 A=65 S=83 D=68 Q=81 E=69 R=82 空格=32",
+                },
+                "hold_ms": {
+                    "type": "integer",
+                    "description": (
+                        "可选的自动松开时长（毫秒）。不填就是一直按住，"
+                        "需要自己调 release_sfs_key"
+                    ),
+                },
+            },
+            "required": ["vk"],
+        },
+        timeout=30,
+    )
+    async def hold_sfs_key(self, vk: int, hold_ms: int = 0, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：按住某个键不放。"""
+        try:
+            result = await self._post_json("/key_down", {"vk": int(vk)})
+        except Exception as exc:
+            self.logger.warning("[sfs_bridge] hold_sfs_key 失败：%s", exc)
+            return {
+                "output": {"ok": False, "message": f"按住失败（未送达）：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            return {
+                "output": {
+                    "ok": False,
+                    "message": f"按住失败：{_as_text(detail.get('error')) or '未知原因'}",
+                },
+                "is_error": True,
+            }
+
+        key = _as_text(detail.get("key")) or str(vk)
+        already = _as_bool(detail.get("already_held"))
+        self.logger.info("[sfs_bridge] hold_sfs_key 按住 %s", key)
+
+        msg = f"已按住 {key}"
+        if already:
+            msg += "（此前已在按住）"
+
+        # 给了 hold_ms 就自动松开
+        if isinstance(hold_ms, int) and hold_ms > 0:
+            await asyncio.sleep(min(hold_ms, 30000) / 1000.0)
+            try:
+                await self._post_json("/key_up", {"vk": int(vk)})
+                msg += f"，已自动松开（按了 {hold_ms} 毫秒）"
+                self.logger.info("[sfs_bridge] hold_sfs_key 自动松开 %s", key)
+            except Exception as exc:
+                msg += f"，但自动松开失败：{exc}"
+        else:
+            msg += "，**记得调 release_sfs_key 松开**"
+
+        return {
+            "output": {"ok": True, "delivered": True, "held": key, "message": msg},
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="release_sfs_key",
+        description=(
+            "【松开】松开之前用 hold_sfs_key 按住的键。"
+            "RCS 平移这类持续推力**必须**在推够之后松开，"
+            "否则航天器会一直朝那个方向加速。"
+            "不填 vk 就松开全部按住的键（急停）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "vk": {
+                    "type": "integer",
+                    "description": "要松开的虚拟键码；不填则松开全部",
+                },
+            },
+        },
+        timeout=30,
+    )
+    async def release_sfs_key(self, vk: int = 0, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：松开按住的键。"""
+        try:
+            if isinstance(vk, int) and vk > 0:
+                result = await self._post_json("/key_up", {"vk": int(vk)})
+            else:
+                result = await self._post_json("/release_all", {})
+        except Exception as exc:
+            self.logger.warning("[sfs_bridge] release_sfs_key 失败：%s", exc)
+            return {
+                "output": {"ok": False, "message": f"松开失败（未送达）：{exc}"},
+                "is_error": True,
+            }
+
+        detail = _as_dict(result)
+        if not _as_bool(detail.get("ok")):
+            return {
+                "output": {"ok": False, "message": "松开失败"},
+                "is_error": True,
+            }
+
+        if isinstance(vk, int) and vk > 0:
+            key = _as_text(detail.get("key")) or str(vk)
+            was = _as_bool(detail.get("was_held"))
+            self.logger.info("[sfs_bridge] release_sfs_key 松开 %s was_held=%s", key, was)
+            msg = f"已松开 {key}" + ("" if was else "（它本来就没被按住）")
+        else:
+            n = detail.get("released", 0)
+            self.logger.info("[sfs_bridge] release_sfs_key 全部松开 共 %s 个", n)
+            msg = f"已松开全部按住的键（{n} 个）"
+
+        return {
+            "output": {
+                "ok": True,
+                "delivered": True,
+                "held": detail.get("held"),
+                "message": msg,
             },
             "is_error": False,
         }
