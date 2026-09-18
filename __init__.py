@@ -50,9 +50,115 @@ _MAX_IMAGES_PER_CALL = 2
 
 # 操作界面的流程提示。随工具返回值一起交给模型，这样猫娘在调用时就能拿到，
 # 不依赖任何外部文档或角色设定。
+
+# ---------------------------------------------------------------------------
+# 给大模型的说明书
+#
+# 有些模型可能完全不了解《航天模拟器》，或者只知道玩法、不清楚本插件提供了
+# 哪些工具。这两份文档就是给它们补课的，通过 read_sfs_docs 工具读取。
+# ---------------------------------------------------------------------------
+
+_SFS_DOC_GAME = """【航天模拟器 Spaceflight Simulator 是什么】
+2D 火箭建造 + 轨道飞行模拟游戏。核心循环：
+造火箭 → 发射 → 入轨 → 变轨 → 对接 → 登陆。
+
+【重要：它不是真实尺度】
+- 地球半径约 315 km（不是真实的 6371 km）
+- 非真实模式下大气高度约 30 km
+- 所以「100 km 卡门线」这类现实数据在这里**不适用**
+- 而且游戏支持**自定义星系包**，每颗星球的半径、重力、大气高度都不同
+→ 任何数值都应该从 get_sfs_status 读，不要凭现实常识猜
+
+【建造界面】
+- 左侧是零件菜单，零件需要**拖动**到火箭上（本插件用加载蓝图或
+  place_sfs_part 绕过拖动）
+- 零件靠**贴合点**连接，间距由零件自身高度决定
+- 蓝图存放在 <游戏目录>/Saving/Blueprints/<名字>/
+- 在建造界面右上角点 Save 可以保存蓝图
+
+【分级（Staging）】
+- 零件会被归入不同的「级」，发射时逐级抛弃空燃料箱
+- 按**回车**执行分级程序（分离 + 点燃下一级）
+- 按**空格**点火 / 熄火
+- 本插件里分级数据在 /state 的 stages 字段
+
+【飞行与轨道】
+- 姿态：Q 左转 / E 右转
+- 油门：Shift 加大 / Ctrl 减小
+- RCS：按 R 开关；开启后用 W/A/S/D 平移与俯仰（**持续推力，要按住**）
+- **入轨的关键**：不是垂直往上冲，而是取得**足够大的水平速度**。
+  垂直冲上去只会掉回来，必须边上升边慢慢压平。
+- 轨道术语：
+  · 远点 apoapsis —— 轨道最高点
+  · 近点 periapsis —— 轨道最低点
+  · 离心率 eccentricity —— 0 是正圆，越接近 1 越扁
+  · 周期 period —— 绕一圈要多久
+  · 是否入轨看**近点有没有高过大气层顶**（这里是 30 km 上下，不是 100 km）
+- 地图界面能看到轨道，也可以做时间加速
+"""
+
+_SFS_DOC_TOOLS = """【工具总览：什么时候用哪个】
+看画面        see_sfs_screen
+看数字        get_sfs_status
+看可点按钮    list_sfs_ui
+点按钮        click_sfs_ui          ← 必须真的调用
+发一次按键    press_sfs_key
+按住按键      hold_sfs_key / release_sfs_key
+飞行指令      control_sfs（油门 / 分级 / RCS）
+视角          control_sfs_camera
+看现有蓝图    list_sfs_blueprints
+加载蓝图      load_sfs_blueprint    ← 造火箭首选
+放单个零件    place_sfs_part
+看零件名      list_sfs_parts
+看火箭设计    get_rocket_design
+评审设计      review_rocket_design
+
+【常见任务的正确顺序】
+
+■ 用户说「开始游戏」「进存档」
+  1. list_sfs_ui 看有哪些按钮
+  2. click_sfs_ui(name="Play")
+  3. **等 3 秒以上**（游戏加载很慢）
+  4. list_sfs_ui 确认界面变了没
+  ⚠️ 进入存档列表后，必须先点一张存档卡片，Play 才会变成可用
+
+■ 用户说「造个火箭」「加载我的火箭」
+  1. list_sfs_blueprints 看有什么
+  2. load_sfs_blueprint 加载（**首选**：尺寸、纹理、分级都由游戏解析，一定正确）
+  3. 没有蓝图时才考虑 place_sfs_part 手拼（不推荐，间距算错就装不上）
+
+■ 用户说「发射」「点火」
+  1. get_sfs_status 确认在飞行场景
+  2. control_sfs(set_throttle) 设油门
+  3. press_sfs_key(vk=32) 空格点火
+  4. 等几秒，再 get_sfs_status 看速度有没有涨
+
+■ 用户说「转向」「用 RCS 平移」
+  hold_sfs_key 按住 → get_sfs_status 看数据 → release_sfs_key 松开
+  ⚠️ **用完必须松开**，否则会一直朝那个方向加速
+
+■ 用户说「对接」「靠近空间站」
+  1. get_sfs_status 看 target.distance 与 closing_speed
+  2. 需要接近就用 hold_sfs_key 按住对应方向的 RCS
+  3. closing_speed 为正表示正在接近
+
+【必须遵守的几条】
+❗ 点按钮只能靠 click_sfs_ui —— 嘴上说「我点了」游戏不会有任何反应
+❗ 游戏切场景很慢，操作后要等，别急着说「没反应」
+❗ 数值一律从 get_sfs_status 读，不要凭现实常识猜（这游戏不是真实尺度）
+❗ 造火箭优先加载蓝图，不要手拼
+❗ 持续推力（RCS / 转向）要用 hold_sfs_key，按一下就松几乎没效果
+"""
+
 _UI_AGENT_GUIDE = (
+    "【不熟悉这款游戏或不知道该用哪个工具？】"
+    "先调 read_sfs_docs 读说明书（游戏知识 + 工具用法）。"
     "【看界面并操作】"
     "❗❗ 点按钮**必须**调用 click_sfs_ui 工具，没有别的途径。"
+    "用户已经明确说要你点某个按钮时（例如「你点击 Load 按钮」、"
+    "「对对对」），那就是**已经授权了** —— "
+    "直接调用工具，**不要再问一遍确认**。"
+    "反复询问然后只说「本喵点了」而不调用工具，对用户来说就是卡住了。"
     "如果你发现自己在说「本喵点了」「爪子按上去了」「已经按了」这类话 —— "
     "那就说明你**忘了调用工具**，游戏此刻没有任何反应，用户会以为插件坏了。"
     "① list_sfs_ui 拿可点击元素清单（或 see_sfs_screen 看画面）；"
@@ -1721,6 +1827,55 @@ class SfsBridgePlugin(NekoPluginBase):
                 "delivered": True,
                 "held": detail.get("held"),
                 "message": msg,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="read_sfs_docs",
+        description=(
+            "【必看】《航天模拟器》与本插件的完整说明书。"
+            "**如果你不了解这款游戏、不清楚它的结构与操作方式，"
+            "或者不确定该用哪个工具、该按什么顺序做 —— 先调这个。**"
+            "topic='game' 读游戏知识（SFS 是什么、建造/分级/轨道怎么运作）；"
+            "topic='tools' 读工具用法（每个工具干什么、常见任务的正确顺序）；"
+            "不填则两份都给。"
+            "用户第一次找你玩这个游戏时，建议先读一遍。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "game / tools / all，默认 all",
+                },
+            },
+        },
+        timeout=20,
+    )
+    async def read_sfs_docs(self, topic: str = "all", **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：读说明书。"""
+        t = (topic or "all").strip().lower()
+        parts: List[str] = []
+        if t in ("game", "all", ""):
+            parts.append(_SFS_DOC_GAME)
+        if t in ("tools", "all", ""):
+            parts.append(_SFS_DOC_TOOLS)
+        if not parts:
+            parts.append(_SFS_DOC_GAME)
+            parts.append(_SFS_DOC_TOOLS)
+
+        body = "\n\n" + ("\n\n" + "=" * 40 + "\n\n").join(parts)
+        return {
+            "output": {
+                "ok": True,
+                "topic": t,
+                "docs": body,
+                "message": (
+                    "以上是游戏与工具的说明。"
+                    "看完之后，想知道当前游戏停在哪一步，"
+                    "可以调 list_sfs_ui（看有哪些按钮）和 get_sfs_status（看数字）。"
+                ),
             },
             "is_error": False,
         }
