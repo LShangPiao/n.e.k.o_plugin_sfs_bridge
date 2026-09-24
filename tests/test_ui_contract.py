@@ -28,9 +28,12 @@ import base64
 import copy
 import importlib
 import importlib.util
+import io
 import json
+import struct
 import sys
 import types
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,11 +65,29 @@ EXPECTED_UI_ACTIONS = {
     "sfs_ui_save_settings",
 }
 
-# 一张最小但合法的 1x1 PNG，用来测截图的内联兜底（不需要 Pillow）。
-_TINY_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/"
-    "q842iQAAAABJRU5ErkJggg=="
-)
+def _tiny_png() -> bytes:
+    """用 stdlib 拼一张**合法**的 1x1 PNG。
+
+    别凭记忆手写 base64：`Image.open` 是惰性的，坏数据要等真正解码像素时才报错，
+    而没装 Pillow 的环境根本走不到那一步 —— 只有 CI（装了 Pillow）会暴露，
+    表现是 `ok=False`「画面已抓取但无法处理」，本地却全绿。
+    """
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)  # 1x1、8bit、RGB
+    scanline = zlib.compress(b"\x00\xff\x80\x00")  # filter=0 + 一个像素
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", scanline)
+        + chunk(b"IEND", b"")
+    )
+
+
+_TINY_PNG = _tiny_png()
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +696,13 @@ def test_screenshot_falls_back_to_inline_data_url() -> None:
     images = FakeImages(available=False)
     plugin = make_plugin(routes={"/screenshot": FakeResponse(content=_TINY_PNG)}, images=images)
     data = payload(run(plugin.sfs_ui_screenshot()))
-    assert data["ok"] is True
+    assert data["ok"] is True, data.get("message")
     assert data["inline"] is True
-    assert data["url"].startswith("data:image/")
-    assert base64.b64decode(data["url"].split(",", 1)[1]) == _TINY_PNG
+    # 装了 Pillow 会被重新编码成 JPEG，没装才原样返回 PNG，所以这里只锁形状：
+    # data URL 的 mime 必须与返回值声明一致，且载荷能解出非空图片。
+    scheme, _, body = str(data["url"]).partition(";base64,")
+    assert scheme == f"data:{data['mime']}", data["url"][:40]
+    assert body and base64.b64decode(body), "内联载荷应该是能解出来的图片"
 
 
 def test_screenshot_reports_failure_when_the_game_returns_nothing() -> None:
@@ -686,6 +710,22 @@ def test_screenshot_reports_failure_when_the_game_returns_nothing() -> None:
     data = payload(run(plugin.sfs_ui_screenshot()))
     assert data["ok"] is False
     assert "截图失败" in data["message"]
+
+
+def test_tiny_png_fixture_is_a_real_image() -> None:
+    """守住踩过的那次 CI 失败：测试图片本身要是合法的。
+
+    `Image.open` 是惰性的，坏数据要到解码像素时才报错 —— 没装 Pillow 的机器
+    全绿、装了 Pillow 的 CI 却红。所以这里在有 Pillow 时真的解一次。
+    """
+    assert _TINY_PNG.startswith(b"\x89PNG\r\n\x1a\n"), "PNG 签名不对"
+    try:
+        from PIL import Image
+    except ImportError:
+        return  # 本机没有 Pillow：上面的签名检查已经够用
+    image = Image.open(io.BytesIO(_TINY_PNG))
+    image.load()  # 真正解码，坏数据在这里才会炸
+    assert image.size == (1, 1)
 
 
 def test_save_settings_clamps_ranges_and_applies_immediately() -> None:
