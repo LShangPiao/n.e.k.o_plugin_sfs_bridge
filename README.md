@@ -173,7 +173,7 @@ Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
 # 面板 TSX 的导入/导出契约 + 类型检查（需要仓库的 typescript 依赖）
 node frontend/plugin-manager/scripts/check-hosted-tsx.mjs plugin/plugins/sfs_bridge/plugin.toml
 
-# UI 接口契约（24 条；SDK 导不进来时会用最小替身，裸 Python 环境也能跑）
+# UI 接口契约（27 条；SDK 导不进来时会用最小替身，裸 Python 环境也能跑）
 python -m pytest plugin/plugins/sfs_bridge/tests/test_ui_contract.py
 ```
 

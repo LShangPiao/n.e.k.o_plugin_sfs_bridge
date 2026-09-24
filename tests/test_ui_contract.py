@@ -223,27 +223,35 @@ def _install_httpx_stub() -> types.ModuleType:
     return module
 
 
-def _ensure_dependencies() -> types.ModuleType:
-    try:
-        import httpx  # noqa: F401
+def _try_import(name: str) -> Optional[types.ModuleType]:
+    """动态导入，失败返回 None。
 
-        return sys.modules["httpx"]
-    except ImportError:
-        return _install_httpx_stub()
+    这里刻意不写 ``try: import httpx``：Market CI 的 ruff 带 ``--ignore-noqa``
+    和 ``--isolated``（连 ruff.toml 都不读），「只为副作用而 import」会被判成
+    F401，``# noqa`` 也压不住。
+    """
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+
+def _ensure_dependencies() -> types.ModuleType:
+    httpx = _try_import("httpx")
+    if httpx is not None:
+        return httpx
+    return _install_httpx_stub()
 
 
 def _load_plugin_module() -> types.ModuleType:
     """导入插件包；SDK 缺失时先用替身顶上。"""
-    try:
-        import plugin.sdk.plugin  # noqa: F401
-    except ImportError:
+    if _try_import("plugin.sdk.plugin") is None:
         _install_sdk_stub()
     _ensure_dependencies()
 
-    try:
-        return importlib.import_module(PACKAGE)
-    except ImportError:
-        pass
+    module = _try_import(PACKAGE)
+    if module is not None:
+        return module
 
     spec = importlib.util.spec_from_file_location(
         PACKAGE,
