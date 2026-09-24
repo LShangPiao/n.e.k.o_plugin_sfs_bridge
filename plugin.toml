@@ -8,7 +8,7 @@ keywords = [
     "游戏", "模拟器", "界面操作", "UI", "点按钮", "主菜单", "存档", "蓝图",
     "rocket", "launch", "telemetry", "screen", "ui automation", "blueprint"
 ]
-version = "0.3.1"
+version = "0.4.0"
 type = "plugin"
 entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
 
@@ -20,6 +20,36 @@ url = "https://xhth.top/"
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"
+
+# ---------------------------------------------------------------------------
+# 造火箭控制台（Hosted UI）
+#
+# 面板是 hosted-tsx surface：它只通过 props.api.call 调插件入口，所以
+# permissions 必须同时给出 action:call（调动作）和 state:read（读面板快照），
+# 少一个按钮就会变成 403；config:read 让面板能读到配置快照。
+#
+# context 指向 ui_api.py 里的 @ui.context(id="dashboard")。host 在每次执行
+# 面板动作前都会取一次这个 provider（用它拿动作白名单），所以两边 id 必须一致。
+# ---------------------------------------------------------------------------
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "dashboard"
+title = "造火箭控制台"
+entry = "ui/panel.tsx"
+mode = "hosted-tsx"
+context = "dashboard"
+permissions = ["state:read", "config:read", "action:call"]
+
+# 上手指南复用面板的 context：markdown 表面不需要自己的 provider，
+# 复用同一个可以少一条 "UI context not found" 警告。
+[[plugin.ui.guide]]
+id = "guide"
+title = "上手指南"
+entry = "docs/guide.md"
+context = "dashboard"
+permissions = ["state:read"]
 
 [plugin_runtime]
 enabled = true

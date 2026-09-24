@@ -42,7 +42,13 @@ from plugin.sdk.plugin import (
     llm_tool,
     neko_plugin,
     plugin_entry,
+    ui,
 )
+
+# 造火箭控制台（Hosted UI）的上下文与动作。
+# ui_api 只依赖 plugin.sdk，不反向 import 本模块（需要本模块的纯函数时按类反查），
+# 所以这里可以正常放在顶部导入。
+from .ui_api import SfsUiMixin
 
 # N.E.K.O. 对工具返回图片的限制（见 plugin/sdk/plugin/llm_tool.py）
 _MAX_BASE64_CHARS = 2 * 1024 * 1024
@@ -426,8 +432,12 @@ def _encode_for_vision(
 # ---------------------------------------------------------------------------
 
 @neko_plugin
-class SfsBridgePlugin(NekoPluginBase):
-    """航天模拟器桥接插件。"""
+class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
+    """航天模拟器桥接插件。
+
+    ``SfsUiMixin`` 提供造火箭控制台（Hosted UI）的 ``@ui.context`` / ``@ui.action``；
+    它只用到本类已有的属性与方法，不改变原有的桥接与 LLM 工具行为。
+    """
 
     def __init__(self, ctx: Any):
         super().__init__(ctx)
@@ -680,6 +690,7 @@ class SfsBridgePlugin(NekoPluginBase):
 
     # -- 插件入口 ---------------------------------------------------------
 
+    @ui.action(id="sfs_status", label="读取遥测", tone="primary", group="读取", order=10)
     @plugin_entry(
         id="sfs_status",
         name="航天模拟器状态",
@@ -707,6 +718,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "state": state,
         })
 
+    @ui.action(id="sfs_command", label="发送飞行指令", tone="warning", group="飞行", order=10)
     @plugin_entry(
         id="sfs_command",
         name="控制航天模拟器",
@@ -783,6 +795,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "message": labels.get(command, f"已发送 {command}"),
         })
 
+    @ui.action(id="sfs_screenshot", label="截图（给模型看）", tone="info", group="画面", order=20)
     @plugin_entry(
         id="sfs_screenshot",
         name="截取游戏画面",
@@ -819,6 +832,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "message": f"已截取画面（{note}）。",
         })
 
+    @ui.action(id="sfs_build", label="读取火箭构成", tone="primary", group="读取", order=20)
     @plugin_entry(
         id="sfs_build",
         name="读取火箭设计",
@@ -847,6 +861,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "build": build,
         })
 
+    @ui.action(id="sfs_ui", label="列出界面按钮", tone="info", group="界面", order=10)
     @plugin_entry(
         id="sfs_ui",
         name="列出游戏界面元素",
@@ -875,6 +890,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "guide": _UI_AGENT_GUIDE,
         })
 
+    @ui.action(id="sfs_click", label="点击界面", tone="warning", group="界面", order=20)
     @plugin_entry(
         id="sfs_click",
         name="点击游戏界面",
@@ -893,7 +909,9 @@ class SfsBridgePlugin(NekoPluginBase):
                 },
             },
         },
-        timeout=30,
+        # 点击后要等游戏切场景（post_click_wait_seconds 可配到 30 秒），
+        # 再回读一次界面元素，所以上限要留够；30 秒会在最慢的档位上误杀。
+        timeout=45,
         llm_result_fields=["ok", "message"],
     )
     async def sfs_click(
@@ -936,6 +954,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "guide": _UI_AGENT_GUIDE,
         })
 
+    @ui.action(id="sfs_parts", label="列出零件名", tone="info", group="建造", order=20)
     @plugin_entry(
         id="sfs_parts",
         name="列出可用零件",
@@ -964,6 +983,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "guide": _UI_AGENT_GUIDE,
         })
 
+    @ui.action(id="sfs_place", label="放置零件", tone="warning", group="建造", order=30)
     @plugin_entry(
         id="sfs_place",
         name="在指定位置放置零件",
@@ -1015,6 +1035,7 @@ class SfsBridgePlugin(NekoPluginBase):
             "placed": detail.get("placed", 0),
         })
 
+    @ui.action(id="sfs_key", label="发送按键", tone="default", group="飞行", order=20)
     @plugin_entry(
         id="sfs_key",
         name="向游戏发送按键",

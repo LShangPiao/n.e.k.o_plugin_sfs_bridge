@@ -8,6 +8,10 @@
 **操作游戏界面**（主菜单、载入存档、建造菜单、设置面板），
 **把整枚蓝图直接加载进建造台**，并评审你的火箭设计。
 
+插件自带一个 **「造火箭控制台」面板**：不用进对话也能看遥测、看画面、点游戏按钮、
+按住键转向、载入蓝图、改配置。面板和猫娘调的是**同一批能力**，两边不会打架 ——
+用法见 [docs/guide.md](docs/guide.md)。
+
 > 📖 **第一次用请先看 [使用教程](使用教程.md)** —— 那里有「你想做什么 → 可以这样说」
 > 的对照表，以及常见问题排查。本文件是技术文档。
 
@@ -111,6 +115,79 @@ pwsh -File build.ps1
 
 常用按键（`press_sfs_key` 的 `vk`）：空格=32 回车=13 Esc=27
 Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
+
+## 造火箭控制台（Hosted UI）
+
+插件在 N.E.K.O. 的插件页面里开了一个面板 surface，用来直接操作游戏而不经过对话。
+它运行在宿主的沙箱 iframe 里：**拿不到 `fetch`、也没有同源权限**，
+所有数据都走 `props.api.call(action_id, args)` → 插件的**入口**。
+
+### 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `plugin.toml` `[plugin.ui]` | 声明 panel / guide surface 与权限（`state:read`、`config:read`、`action:call`） |
+| `ui/panel.tsx` | 面板本体（hosted-tsx）：六个页签 总览 / 画面 / 界面 / 飞行 / 建造 / 设置 |
+| `ui_api.py` | `@ui.context(id="dashboard")` 提供者 + 面板专用动作（聚合快照、画面预览、按住/松开、蓝图、视角、独占模式、保存设置） |
+| `docs/guide.md` | 面板内的上手指南（markdown surface） |
+
+### 设计取舍
+
+- **已存在的能力不重写**：遥测、指令、界面清单、点击、按键、零件、放置、截图
+  这些逻辑本来就在 `__init__.py` 里，面板**直接复用** —— 只在原方法上叠加
+  `@ui.action` 把它们暴露给面板。两份实现迟早会跑偏。
+- **面板专属能力集中放**：只有面板才需要的东西（聚合、预览、按住、保存配置）
+  集中在 `ui_api.py`，不再撑大 `__init__.py`。
+- **`@ui.context` 不做网络请求**：host 在**每次**面板动作之前都会重新求值这个
+  provider（用它取动作白名单），所以它必须是纯本地读取 + 绝不抛异常。
+  连通性探测交给 `sfs_ui_ping` / `sfs_ui_snapshot`。
+- **面板动作的 id 必须同时是一个 `@plugin_entry`**：`@ui.action` 只贴元数据，
+  host 最终是 `trigger(entry_id)` 去调它；少了 `@plugin_entry` 会 404。
+  两边的 id 也要写成一致。
+
+### 面板能调的动作
+
+| 动作 id | 来源 | 说明 |
+| --- | --- | --- |
+| `sfs_ui_ping` | 本插件 | 只打一次 `/ping`，用于按秒轮询的连通性检测 |
+| `sfs_ui_snapshot` | 本插件 | 一次性聚合：遥测 + 火箭构成 + 界面元素 + 蓝图 |
+| `sfs_ui_screenshot` | 本插件 | 画面预览：优先走宿主临时图片接口拿 URL，失败退回内联 data URL |
+| `sfs_ui_hold_key` / `sfs_ui_release_key` | 本插件 | 按住 / 松开（不填 `vk` 即全部松开，面板的急停） |
+| `sfs_ui_blueprints` / `sfs_ui_load_blueprint` | 本插件 | 蓝图列表 / 载入整枚蓝图 |
+| `sfs_ui_camera` | 本插件 | 视角：`zoom_delta` / `distance` / `x` / `y` / `rotation` |
+| `sfs_ui_exclusive` | 本插件 | Agent 独占模式（游戏忽略用户输入，F10 应急解除） |
+| `sfs_ui_save_settings` | 本插件 | 保存配置并**立即生效**；`vlm_api_key` 留空表示保持原值 |
+| `sfs_status` / `sfs_build` / `sfs_ui` / `sfs_click` / `sfs_key` / `sfs_command` / `sfs_screenshot` / `sfs_parts` / `sfs_place` | 原有入口 | 叠加 `@ui.action` 暴露，行为与原 LLM 通路完全一致 |
+
+### 两个容易踩的坑
+
+1. **`/exclusive` 的 `on` 必须发带引号的字符串**（`{"on": "true"}`）。
+   模组侧用 `ExtractString` 解析这个字段，发 JSON 布尔会被当成「没给」而**变成切换**，
+   面板开关就会和实际状态反着来。
+2. **API Key 只写不读**：`@ui.context` 只回报 `vlm_api_key_configured`，
+   原值不出插件进程；面板留空提交时不会写 `api_key`，已有的密钥不会被清掉。
+
+### 验证
+
+```bash
+# 面板 TSX 的导入/导出契约 + 类型检查（需要仓库的 typescript 依赖）
+node frontend/plugin-manager/scripts/check-hosted-tsx.mjs plugin/plugins/sfs_bridge/plugin.toml
+
+# UI 接口契约（24 条；SDK 导不进来时会用最小替身，裸 Python 环境也能跑）
+python -m pytest plugin/plugins/sfs_bridge/tests/test_ui_contract.py
+```
+
+`test_ui_contract.py` 守住的几条：面板会调的每个动作都同时是 `@ui.action` 与
+`@plugin_entry`、动作 id 与入口 id 一致、context provider 不发网络请求且 JSON 安全、
+独占模式发带引号的字符串、设置保存的范围钳制与密钥不回显，
+以及**面板的超时不得短于入口自己声明的 timeout**。
+
+> 桥接层（ui-kit 的 `requestHost`）默认只等 30 秒，而抓图要等游戏渲染、
+> 点击要等它切场景、载入蓝图要重建整枚火箭。所以 `ui/panel.tsx` 里有一张
+> `TIMEOUTS` 表给重动作单独放宽，上面的测试会把这张表和入口的 `timeout=`
+> 对一遍。顺带把 `sfs_click` 的入口超时从 30 秒提到 45 秒：
+> `post_click_wait_seconds` 本身就可以配到 30 秒，再加一次界面回读，
+> 原来的 30 秒会在最慢的档位上误杀。
 
 ## SFS 默认操作方法
 
