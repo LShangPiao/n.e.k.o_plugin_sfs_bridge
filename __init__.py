@@ -128,7 +128,9 @@ _SFS_DOC_TOOLS = """【工具总览：什么时候用哪个】
   4. list_sfs_ui 确认界面变了没
   ⚠️ 进入存档列表后，必须先点一张存档卡片，Play 才会变成可用
 
-■ 用户说「造个火箭」「加载我的火箭」
+■ 用户说「造个火箭」「有什么现成的」
+  0. **先看预设**：list_sfs_presets -> load_sfs_preset
+     模组自带「基础火箭 / 二级火箭 / 三级火箭」，直接加载即可，最适合新手。**记得告诉用户有预设可用。**
   1. list_sfs_blueprints 看有什么
   2. load_sfs_blueprint 加载（**首选**：尺寸、纹理、分级都由游戏解析，一定正确）
      模组自带一枚「SFS-Agent 示例」（官方结构、31 个零件；没有其他蓝图时直接用它）
@@ -1844,6 +1846,125 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                 "delivered": True,
                 "held": detail.get("held"),
                 "message": msg,
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="list_sfs_presets",
+        description=(
+            "列出模组自带的**预设蓝图**（官方示例火箭）。"
+            "预设是模组内置的入门火箭，**不占用也不显示在用户的蓝图列表里**。"
+            "用户说「造个火箭」「有什么现成的」时，先调这个。"
+            "想加载就用 load_sfs_preset。"
+        ),
+        parameters={"type": "object", "properties": {}},
+        timeout=20,
+    )
+    async def list_sfs_presets(self, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：列出预设蓝图。"""
+        try:
+            data = _as_dict(await self._get_json("/presets"))
+        except Exception as exc:
+            return {
+                "output": {"ok": False, "message": f"读取预设列表失败：{exc}"},
+                "is_error": True,
+            }
+
+        names = data.get("presets") or []
+        if not names:
+            return {
+                "output": {
+                    "ok": False,
+                    "message": "模组没有提供预设蓝图（或模组版本过旧）。",
+                },
+                "is_error": True,
+            }
+
+        lines = "、".join(str(n) for n in names)
+        return {
+            "output": {
+                "ok": True,
+                "count": len(names),
+                "presets": names,
+                "message": (
+                    f"模组自带 {len(names)} 枚预设火箭：{lines}。"
+                    "这些是官方示例，**不在用户的蓝图列表里**，"
+                    "用 load_sfs_preset 可以直接加载到建造页面。"
+                    "可以告诉用户：想从零开始的话有现成的预设可以直接用。"
+                ),
+            },
+            "is_error": False,
+        }
+
+    @llm_tool(
+        name="load_sfs_preset",
+        description=(
+            "把模组自带的**预设蓝图**加载到建造页面。"
+            "预设不写入用户的蓝图目录，所以不会弄乱用户自己的蓝图列表。"
+            "用户说「造个基础火箭」「来个能飞的」「加载示例」时用这个。"
+            "不在建造场景时会自动进入建造页面。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "预设名，如「基础火箭」「二级火箭」「三级火箭」",
+                },
+            },
+            "required": ["name"],
+        },
+        timeout=60,
+    )
+    async def load_sfs_preset(self, name: str, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：加载预设蓝图。"""
+        try:
+            data = _as_dict(await self._post_json("/preset_load", {"name": name}))
+        except Exception as exc:
+            self.logger.warning("[sfs_bridge] load_sfs_preset 失败：%s", exc)
+            return {
+                "output": {"ok": False, "message": f"加载预设失败（未送达）：{exc}"},
+                "is_error": True,
+            }
+
+        if not _as_bool(data.get("ok")):
+            msg = _as_text(data.get("error")) or "未知原因"
+            self.logger.warning("[sfs_bridge] load_sfs_preset 未成功：%s", msg)
+            # 名字写错时把可用的列出来，方便重试
+            try:
+                avail = _as_dict(await self._get_json("/presets")).get("presets") or []
+            except Exception:
+                avail = []
+            if avail:
+                msg += "；可用预设：" + "、".join(str(x) for x in avail)
+            return {
+                "output": {"ok": False, "message": msg},
+                "is_error": True,
+            }
+
+        result = _as_text(data.get("result")) or f"已加载预设「{name}」"
+        self.logger.info("[sfs_bridge] load_sfs_preset %s", result)
+
+        # 顺带回读零件数，方便确认真的加载上了
+        detail = ""
+        try:
+            build = _as_dict(await self._get_json("/build"))
+            n = build.get("part_count")
+            if n is not None:
+                detail = f"当前建造页面有 {n} 个零件。"
+        except Exception:
+            pass
+
+        return {
+            "output": {
+                "ok": True,
+                "delivered": True,
+                "result": result,
+                "message": (
+                    f"{result}。{detail}"
+                    "这是模组自带的预设，不会出现在用户自己的蓝图列表里。"
+                ),
             },
             "is_error": False,
         }
