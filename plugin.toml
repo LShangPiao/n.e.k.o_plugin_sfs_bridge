@@ -1,7 +1,7 @@
 [plugin]
 id = "sfs_bridge"
 name = "和猫娘一起造火箭(SFS)"
-description = "连接 Spaceflight Simulator（航天模拟器），让猫娘读取飞行遥测、查看游戏画面、操作游戏界面（主菜单、载入存档、建造菜单、设置），并能把整枚蓝图直接加载进建造台、对火箭设计给出建议。点击是游戏内输入派发，不会移动你的鼠标。需要先在游戏 Mods 目录安装配套的 SFS-Agent 模组。"
+description = "连接 Spaceflight Simulator（航天模拟器），让猫娘读取飞行遥测、查看游戏画面、操作游戏界面（主菜单、载入存档、建造菜单、设置），并能把整枚蓝图直接加载进建造台、对火箭设计给出建议。点击是游戏内输入派发，不会移动你的鼠标。需先在游戏 Mods 目录安装配套模组 SFS-Agent，下载：https://github.com/LShangPiao/SFS-Agent/releases"
 short_description = "让猫娘陪你玩航天模拟器：读懂火箭、操作界面、加载蓝图、还能帮你飞"
 keywords = [
     "航天模拟器", "SFS", "spaceflight", "火箭", "造火箭", "发射", "遥测", "看画面",
