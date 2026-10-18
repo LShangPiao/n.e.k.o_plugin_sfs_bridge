@@ -410,6 +410,10 @@ DEFAULT_CONFIG = {
         "screenshot_jpeg_quality": 80,
         "vision_enabled": True,
         "vision_prompt": "看看画面",
+        # 本文件只验证 UI 契约，把自动播报关掉 —— 否则 on_startup 会起一个
+        # 后台任务顺手读一次 /state，污染下面「一个请求都没发」的断言。
+        # 自动播报自己的行为由 tests/test_auto_brief.py 覆盖。
+        "auto_brief_enabled": False,
     },
     "vlm_fallback": {
         "enabled": False,

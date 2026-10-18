@@ -231,6 +231,11 @@ _USER_AGENT = "N.E.K.O-sfs-bridge-plugin/0.1"
 # 用户可在 plugin.toml 的 post_click_wait_seconds 里调整。
 _POST_CLICK_WAIT = 3.0
 
+# 自动播报：push_message 的合并键。同一个 key 的排队消息只会保留最新一条，
+# 所以后台按固定间隔反复推也不会把角色的上下文越堆越长。
+AUTO_BRIEF_COALESCE_KEY = "sfs_auto_brief"
+AUTO_BRIEF_PREFIX = "【航天模拟器自动播报】"
+
 
 # ---------------------------------------------------------------------------
 # 工具函数
@@ -299,6 +304,18 @@ def _describe_state(state: Dict[str, Any]) -> str:
         parts.append("（当前不在飞行中，可能处于建造场景）")
 
     return "；".join(parts) if parts else "已连接游戏，但暂时读不到有效遥测。"
+
+
+def _auto_brief_line(state: Dict[str, Any]) -> str:
+    """把 /state 压成一行自动播报。
+
+    游戏不在世界场景（主菜单、加载中）时返回空串，表示「这条不用发」——
+    反复播报「不在世界场景」只是浪费上下文。
+    刻意压短：这一段会一直待在上下文里，跟着每一轮对话走。
+    """
+    if not _as_bool(state.get("in_world")):
+        return ""
+    return AUTO_BRIEF_PREFIX + _describe_state(state)
 
 
 def _summarize_ui(data: Dict[str, Any], limit: int = 20) -> str:
@@ -472,6 +489,14 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop: Any = None
 
+        # 自动播报（游戏在跑就自己在后台读遥测，推进角色上下文）
+        self._auto_brief_enabled: bool = True
+        self._auto_brief_interval: float = 20.0
+        self._auto_brief_task: Any = None
+        self._auto_brief_stop: Any = None
+        self._auto_brief_last_text: str = ""
+        self._auto_brief_last_ok: Optional[bool] = None
+
     # -- 基础设施 ---------------------------------------------------------
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -634,6 +659,105 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             return " ".join(t for t in texts if t)
         return ""
 
+    # -- 自动播报 ---------------------------------------------------------
+
+    async def _auto_brief_once(self) -> None:
+        """读一次遥测，把最新情况推进角色上下文（不打断对话）。
+
+        用 `ai_behavior="read"`：消息进 LLM 上下文但不会立刻触发一轮对话，
+        主人下次开口时角色已经知道火箭什么状况，不用再主动去调工具。
+        """
+        try:
+            state = await self._get_json("/state")
+            connected = True
+        except SdkError:
+            state = {}
+            connected = False
+        except Exception as exc:  # pragma: no cover
+            self.logger.debug("自动播报读取失败: {}", exc)
+            return
+
+        if connected:
+            text = _auto_brief_line(state)
+            if not text:
+                # 不在世界场景（主菜单/加载中），这条不用发。
+                self._auto_brief_last_ok = True
+                return
+        else:
+            if not self._auto_brief_last_ok:
+                # 从来没连上过就别灌噪音了，主人自己会问。
+                return
+            text = f"{AUTO_BRIEF_PREFIX}游戏已经退出或断开了，读不到新的遥测数据。"
+
+        if connected == self._auto_brief_last_ok and text == self._auto_brief_last_text:
+            return
+
+        try:
+            result = self.push_message(
+                visibility=[],
+                ai_behavior="read",
+                coalesce_key=AUTO_BRIEF_COALESCE_KEY,
+                source="sfs_auto_brief",
+                parts=[{"type": "text", "text": text}],
+            )
+            if not _as_dict(result).get("submitted"):
+                self.logger.debug("自动播报未进队: {}", result)
+        except Exception as exc:  # pragma: no cover
+            self.logger.debug("自动播报推送失败: {}", exc)
+            return
+
+        self._auto_brief_last_ok = connected
+        self._auto_brief_last_text = text
+
+    def _start_auto_brief(self) -> None:
+        """起后台轮询任务（幂等）。"""
+        # 用 getattr：测试里常用 __new__ 造实例，没走 __init__。
+        task = getattr(self, "_auto_brief_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            self._auto_brief_stop = asyncio.Event()
+            self._auto_brief_task = asyncio.create_task(self._auto_brief_loop())
+        except RuntimeError:  # pragma: no cover - 没有事件循环（单测/同步启动）
+            self._auto_brief_stop = None
+            self._auto_brief_task = None
+
+    async def _stop_auto_brief(self) -> None:
+        """停掉后台轮询任务（幂等）。"""
+        # 用 getattr：测试里常用 __new__ 造实例，没走 __init__。
+        task = getattr(self, "_auto_brief_task", None)
+        stop = getattr(self, "_auto_brief_stop", None)
+        self._auto_brief_task = None
+        self._auto_brief_stop = None
+        if stop is not None:
+            stop.set()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # pragma: no cover
+                self.logger.debug("自动播报任务收尾出错: {}", exc)
+
+    async def _auto_brief_loop(self) -> None:
+        """按间隔循环播报，直到被叫停。"""
+        stop = self._auto_brief_stop
+        while stop is not None and not stop.is_set():
+            try:
+                await self._auto_brief_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover
+                self.logger.debug("自动播报循环出错: {}", exc)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self._auto_brief_interval)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            return
+
     # -- 生命周期 ---------------------------------------------------------
 
     @lifecycle(id="startup")
@@ -678,21 +802,34 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
 
         self._vlm = _as_dict(cfg.get("vlm_fallback"))
 
+        self._auto_brief_enabled = _as_bool(section.get("auto_brief_enabled"), True)
+        try:
+            brief_interval = float(section.get("auto_brief_interval_seconds", 20))
+        except (TypeError, ValueError):
+            brief_interval = 20.0
+        self._auto_brief_interval = min(max(brief_interval, 5.0), 300.0)
+
         self.logger.info(
-            "SfsBridge 已就绪，桥接地址={} 视觉={} 自带模型={}",
+            "SfsBridge 已就绪，桥接地址={} 视觉={} 自带模型={} 自动播报={}",
             self._bridge_url,
             self._vision_enabled,
             _as_bool(self._vlm.get("enabled")),
+            f"开/{self._auto_brief_interval:g}s" if self._auto_brief_enabled else "关",
         )
+        if self._auto_brief_enabled:
+            self._start_auto_brief()
         return Ok({
             "status": "ready",
             "bridge_url": self._bridge_url,
             "vision_enabled": self._vision_enabled,
             "vlm_fallback_enabled": _as_bool(self._vlm.get("enabled")),
+            "auto_brief": self._auto_brief_enabled,
+            "auto_brief_interval_seconds": self._auto_brief_interval,
         })
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
+        await self._stop_auto_brief()
         client = self._client
         self._client = None
         self._client_loop = None

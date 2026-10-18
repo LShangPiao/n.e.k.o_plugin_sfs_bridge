@@ -8,7 +8,7 @@ keywords = [
     "游戏", "模拟器", "界面操作", "UI", "点按钮", "主菜单", "存档", "蓝图",
     "rocket", "launch", "telemetry", "screen", "ui automation", "blueprint"
 ]
-version = "0.5.1"
+version = "0.6.0"
 type = "plugin"
 entry = "plugin.plugins.sfs_bridge:SfsBridgePlugin"
 
@@ -80,6 +80,14 @@ screenshot_jpeg_quality = 80
 vision_enabled = true
 # 视觉提示词：告诉模型这张图是什么、要看什么。
 vision_prompt = "这是航天模拟器 Spaceflight Simulator 的当前游戏画面。请描述你看到的火箭结构、飞行阶段与环境，并结合用户的提问回答。"
+# 自动播报：游戏在跑的时候，插件会自己在后台读遥测，把最新的火箭状况
+# 塞进角色的上下文里（不会打断对话），这样角色不用等你开口才去调工具。
+# 关掉它就退回旧的「问答式」行为：只有你问了才读。
+auto_brief_enabled = true
+# 自动播报的轮询间隔（秒），范围 5-300。
+# 同一时刻队列里只保留最新一条（coalesce），所以调小不会把上下文撑爆。
+# 默认 20 秒：起飞和入轨阶段参数变化快，间隔太大容易报旧数。
+auto_brief_interval_seconds = 20
 
 # ---------------------------------------------------------------------------
 # 可选：自带视觉模型
