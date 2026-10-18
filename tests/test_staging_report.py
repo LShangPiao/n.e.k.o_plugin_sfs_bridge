@@ -119,7 +119,9 @@ def test_stages_empty_when_nothing_known() -> None:
 def test_propulsion_all_engines_off() -> None:
     text = "".join(_describe_propulsion(FLIGHT))
     assert "引擎 0/25 台点火" in text
-    assert "按回车" in text
+    assert "按回车" not in text
+    assert "ignite" in text
+    assert "engine_on" in text
     assert "燃料 99%" in text
     assert "比冲 240 秒" in text
     # 推力为 0 也要照实说，不能省
@@ -202,3 +204,16 @@ def test_sfs_command_accepts_ignite() -> None:
     assert result.value.get("ok") is True
     assert "点火" in result.value.get("message", "")
     assert plugin.sent == [("ignite", 0.0)]
+
+
+def test_both_entry_points_accept_engine_on() -> None:
+    """程序化搭出来的火箭没有分级程序，必须能强制点燃引擎。"""
+    plugin = _make_plugin()
+    result = asyncio.run(plugin.control_sfs(command="engine_on"))
+    assert result["is_error"] is False
+    assert "点燃" in result["output"]["message"]
+
+    entry = asyncio.run(plugin.sfs_command(command="engine_on"))
+    assert entry.value.get("ok") is True
+    assert plugin.sent == [("engine_on", 0.0), ("engine_on", 0.0)]
+

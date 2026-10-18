@@ -331,7 +331,8 @@ def _describe_propulsion(state: Dict[str, Any]) -> List[str]:
         lit = on if isinstance(on, int) else 0
         text = f"引擎 {lit}/{total} 台点火"
         if lit == 0:
-            text += "（全都熄着：按回车执行分级程序才会点火，空格只是油门开关）"
+            text += "（全都熄着：先确认油门闸门已开，再发 ignite；"
+            text += "程序化搭出来的火箭没有分级程序，ignite 无效就发 engine_on）"
         bits.append(text)
 
     fuel = prop.get("fuel_percent")
@@ -482,6 +483,18 @@ def _describe_build(build: Dict[str, Any]) -> str:
     if isinstance(stages, int) and stages > 0:
         parts.append(f"{stages} 个分级")
 
+    # bodies / loose_parts 才是「真的连上了没有」——以前这里只有 connected，
+    # 那个字段只说明 HTTP 通不通，害得猫娘对着四个悬空零件说「连成一体了」。
+    bodies = build.get("bodies")
+    loose = build.get("loose_parts")
+    if isinstance(bodies, int) and bodies >= 1:
+        if isinstance(loose, int) and loose > 0:
+            parts.append(
+                f"零件分成 {bodies} 块，其中 {loose} 个零件是悬空的（没贴到其他零件）"
+            )
+        else:
+            parts.append("所有零件连成一体")
+
     kinds = build.get("part_kinds") or []
     if isinstance(kinds, list):
         detail_items: List[str] = []
@@ -496,6 +509,102 @@ def _describe_build(build: Dict[str, Any]) -> str:
             parts.append("主要零件：" + "、".join(detail_items))
 
     return "；".join(parts) + "。"
+
+
+# 目录里的官方名是「词序反着」的（Engine Hawk / Separator / Fuel Tank），
+# 而模型和玩家只会说「Hawk Engine」「级间分离器」。以前直接把名字透传，
+# 于是十次里有九次回「未知零件名」——这就是「叫它四五次才放一个零件」。
+_PART_CN = {
+    "燃料罐": "Fuel Tank",
+    "油箱": "Fuel Tank",
+    "燃料箱": "Fuel Tank",
+    "引擎": "Engine Hawk",
+    "发动机": "Engine Hawk",
+    "鹰引擎": "Engine Hawk",
+    "分离器": "Separator",
+    "级间分离器": "Separator",
+    "助推器": "Booster Tut 1",
+    "降落伞": "Parachute",
+    "伞": "Parachute",
+    "返回舱": "Capsule",
+    "座舱": "Capsule",
+    "指令舱": "Capsule",
+    "整流罩": "Fairing",
+    "锥": "Cone",
+    "圆锥": "Cone",
+    "侧分离器": "Side Separator",
+    "侧挂舱": "Side Fuselage",
+    "侧油箱": "Side Fuselage",
+    "热盾": "Heat Shield",
+    "隔热罩": "Heat Shield",
+    "太阳能板": "Solar Array 2",
+    "太阳翼": "Solar Array 2",
+    "电池": "Placeholder Battery",
+    "同位素电池": "Placeholder RTG",
+    "离子推进器": "Placeholder ION",
+    "电推": "Placeholder ION",
+    "着陆腿": "Landing Leg",
+    "起落架": "Landing Leg",
+    "轮子": "Wheel Medium",
+    "对接端口": "Docking Port",
+    "对接口": "Docking Port",
+    "探针": "Probe",
+    "结构杆": "Strut",
+    "支柱": "Strut",
+}
+
+
+def _part_words(text: str) -> List[str]:
+    """把零件名拆成小写单词表（按非字母数字切）。"""
+    out: List[str] = []
+    cur = ""
+    for ch in text.lower():
+        if ch.isalnum():
+            cur += ch
+        elif cur:
+            out.append(cur)
+            cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _resolve_part_name(name: Any, catalog: List[str]) -> Optional[str]:
+    """把用户/模型给的零件名对到目录里的官方名；对不上返回 None。"""
+    target = _as_text(name).strip()
+    if not target:
+        return None
+    if target in catalog:
+        return target
+
+    alias = _PART_CN.get(target)
+    if alias and alias in catalog:
+        return alias
+
+    low = target.lower()
+    for item in catalog:
+        if item.lower() == low:
+            return item
+
+    words = _part_words(target)
+    if not words:
+        return None
+    want = set(words)
+
+    # 词序不同（Hawk Engine -> Engine Hawk）
+    for item in catalog:
+        if set(_part_words(item)) == want:
+            return item
+
+    # 目录名包含全部关键词，且只命中一个（Hawk -> Engine Hawk）
+    hits = [i for i in catalog if want and want.issubset(set(_part_words(i)))]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        # 多个命中时取最短的（最贴近原意）
+        hits.sort(key=len)
+        return hits[0]
+    return None
 
 
 def _encode_for_vision(
@@ -621,6 +730,24 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             return response.json()
         except ValueError as exc:
             raise SdkError("游戏桥接服务返回的内容不是合法 JSON。") from exc
+
+    async def _get_part_catalog(self) -> List[str]:
+        """拿完整的零件目录（只缓存成功的结果）。
+
+        必须走 deep（默认）那条路：`/build_catalog?deep=0` 只回场景里已有的零件，
+        常常只有三五个，拿它做名字匹配会把可用零件全判成「不存在」。
+        """
+        cached = getattr(self, "_part_catalog", None)
+        if cached:
+            return list(cached)
+        try:
+            data = await self._get_json("/build_catalog")
+        except Exception:
+            return []
+        parts = [str(item) for item in (data.get("parts") or []) if str(item)]
+        if parts:
+            self._part_catalog = parts
+        return parts
 
     async def _post_command(self, name: str, value: float = 0.0) -> Dict[str, Any]:
         """向游戏发送一条控制指令。"""
@@ -962,8 +1089,11 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "向游戏发送控制指令。支持：set_throttle（设置油门 0-1）、"
             "throttle_on / throttle_off（油门闸门开关）、"
             "ignite（**点火**，等价于按回车）、stage（执行下一级）、"
-            "staging_program（执行分级控制程序）、rcs_on、rcs_off、rcs_toggle。"
+            "staging_program（执行分级控制程序）、"
+            "engine_on（**强制点燃所有引擎**，用于程序化搭建、没有分级程序的火箭）、"
+            "rcs_on、rcs_off、rcs_toggle。"
             "⚠️ 想点火一律用 ignite；空格只会切换油门闸门，不会点燃引擎。"
+            "⚠️ 如果 ignite 之后推力仍然是 0，改用 engine_on。"
         ),
         input_schema={
             "type": "object",
@@ -977,6 +1107,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                         "ignite",
                         "stage",
                         "staging_program",
+                        "engine_on",
                         "rcs_on",
                         "rcs_off",
                         "rcs_toggle",
@@ -1003,6 +1134,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "ignite",
             "stage",
             "staging_program",
+            "engine_on",
             "rcs_on",
             "rcs_off",
             "rcs_toggle",
@@ -1025,6 +1157,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "ignite": "已执行点火（回车 / 分级程序）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
+            "engine_on": "已直接点燃所有引擎（绕过分级程序）",
             "rcs_on": "已打开 RCS",
             "rcs_off": "已关闭 RCS",
             "rcs_toggle": "已切换 RCS 开关",
@@ -1081,7 +1214,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "建造场景与飞行场景都支持。"
         ),
         timeout=30,
-        llm_result_fields=["connected", "mode", "part_count", "summary"],
+        llm_result_fields=["connected", "mode", "part_count", "bodies", "loose_parts", "summary"],
     )
     async def sfs_build(self, **_):
         """读取火箭设计（零件构成）。"""
@@ -1097,6 +1230,8 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "connected": True,
             "mode": _as_text(build.get("mode")),
             "part_count": build.get("part_count", 0),
+            "bodies": build.get("bodies", 0),
+            "loose_parts": build.get("loose_parts", 0),
             "summary": _describe_build(build),
             "build": build,
         })
@@ -1746,27 +1881,25 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
     )
     async def list_sfs_parts(self, **kwargs: Any) -> Dict[str, Any]:
         """LLM 工具：列出可用零件。"""
-        try:
-            data = await self._get_json("/build_catalog")
-        except Exception as exc:
+        parts = await self._get_part_catalog()
+        if not parts:
             return {
                 "output": {
                     "ok": False,
                     "count": 0,
                     "message": (
-                        f"读不到零件目录（{exc}）。请如实告诉用户游戏可能没有运行，"
-                        "不要编造零件名。"
+                        "读不到零件目录。请如实告诉用户游戏可能没有运行，"
+                        "或者还没进到建造场景，不要编造零件名。"
                     ),
                 },
                 "is_error": False,
             }
 
-        parts = data.get("parts") or []
-        listing = "、".join(str(p) for p in parts[:60])
+        listing = "、".join(parts[:60])
         return {
             "output": {
                 "ok": True,
-                "count": data.get("count", len(parts)),
+                "count": len(parts),
                 "parts": parts,
                 "summary": f"可用零件共 {len(parts)} 种：{listing}",
                 "guide": _UI_AGENT_GUIDE,
@@ -1777,37 +1910,53 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
     @llm_tool(
         name="place_sfs_part",
         description=(
-            "在航天模拟器的建造界面，把指定零件直接放到坐标 (x, y) 上。"
+            "在航天模拟器的建造界面装上一个零件。"
+            "**默认 stack=\"auto\"：自动贴到现有零件的最高点**，不需要算坐标，"
+            "这是最可靠的用法——说「加一个燃料罐」就直接调它。"
+            "stack=\"bottom\" 贴到最下面（装引擎/分离器），"
+            "stack=\"top\" 贴到最上面（装伞、座舱），"
+            "stack=\"none\" 才按 x、y 自由摆放（会悬空，除非很清楚位置）。"
+            "零件名可以用中文（燃料罐/引擎/分离器/降落伞/返回舱……）"
+            "或目录里的英文名，会自动对上官方名。\n"
+            "返回的 bodies / loose_parts 才是「真的连上了没有」："
+            "loose_parts > 0 说明有零件悬空，要接着补或者换 stack。"
             "建造界面里零件本来必须从菜单拖到火箭上，纯点击放不上去；"
-            "这个工具绕开拖动，直接把零件生成在指定位置，也不会移动用户鼠标。"
-            "x、y 是建造网格坐标，0 是画面中心，向右/向上为正；"
-            "**一大格 = 1 米，一小格 = 0.5 米**，间距按米算。"
-            "⚠️ 零件必须落在对方的**有效附着面**上才连得成一体："
-            "引擎/降落伞/电推贴上边，RCS 与太阳能板贴左侧，"
-            "轮子贴上面（上半边中间一小块），着陆腿只有下面那一点；"
-            "其余零件的**内部也算有效面**，可以嵌进去一点。\n"
-            "拼不准时优先改用 load_sfs_blueprint —— 那是可靠得多的路径。"
-            "用户说「帮我加一个燃料罐」「在火箭下面装个引擎」时用它。"
-            "零件名要先通过 list_sfs_parts 确认。"
+            "这个工具绕开拖动，直接把零件生成出来，也不会移动用户鼠标。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "零件名称，需与 list_sfs_parts 返回的一致",
+                    "description": "零件名称（中文，或 list_sfs_parts 返回的英文名）",
                 },
-                "x": {"type": "number", "description": "网格横坐标，0 为画面中心"},
-                "y": {"type": "number", "description": "网格纵坐标，0 为画面中心"},
+                "stack": {
+                    "type": "string",
+                    "enum": ["auto", "top", "bottom", "none"],
+                    "description": "贴合方式，默认 auto（贴到现有零件最高点）",
+                },
+                "x": {
+                    "type": "number",
+                    "description": "仅 stack=none 时需要：网格横坐标，0 为画面中心",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "仅 stack=none 时需要：网格纵坐标，0 为画面中心",
+                },
             },
             "required": ["name"],
         },
         timeout=40,
     )
     async def place_sfs_part(
-        self, name: str, x: float = 0.0, y: float = 0.0, **kwargs: Any
+        self,
+        name: str,
+        stack: str = "auto",
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """LLM 工具：在指定位置放置零件。"""
+        """LLM 工具：装上一个零件（默认自动贴合）。"""
         clean = _as_text(name)
         if not clean:
             return {
@@ -1817,10 +1966,37 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                 },
                 "is_error": True,
             }
+
+        mode = _as_text(stack).lower() or "auto"
+        if mode not in ("auto", "top", "bottom", "none"):
+            mode = "auto"
+
+        # 先把名字对到官方内部名。对不上就当场说清楚，
+        # 不要让模组回一句「未知零件名」把模型带进死循环。
+        catalog = await self._get_part_catalog()
+        resolved = _resolve_part_name(clean, catalog) if catalog else None
+        if catalog and not resolved:
+            sample = "、".join(catalog[:24])
+            return {
+                "output": {
+                    "ok": False,
+                    "message": (
+                        f"零件目录里没有「{clean}」。可用的有：{sample}……"
+                        "（可以先用 list_sfs_parts 看全表）"
+                    ),
+                },
+                "is_error": True,
+            }
+        part_name = resolved or clean
+
+        payload: Dict[str, Any] = {"name": part_name, "stack": mode}
+        if x is not None:
+            payload["x"] = float(x)
+        if y is not None:
+            payload["y"] = float(y)
+
         try:
-            result = await self._post_json(
-                "/build_place", {"name": clean, "x": float(x), "y": float(y)}
-            )
+            result = await self._post_json("/build_place", payload)
         except Exception as exc:
             return {
                 "output": {"ok": False, "message": f"放置零件失败：{exc}"},
@@ -1835,17 +2011,53 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                     "ok": False,
                     "message": (
                         f"放置零件失败：{reason}。"
-                        "请确认游戏处于建造场景（不是主菜单或飞行中），且零件名正确。"
+                        "请确认游戏处于建造场景（不是主菜单或飞行中）。"
                     ),
                 },
                 "is_error": True,
             }
 
+        # 放完立刻回读一次整体：这才是「连成一体」的真凭据
+        build: Dict[str, Any] = {}
+        try:
+            build = _as_dict(await self._get_json("/build"))
+        except Exception:
+            build = {}
+
+        placed_x = detail.get("x")
+        placed_y = detail.get("y")
+        lines = [f"已装上一个「{part_name}」"]
+        if resolved and resolved != clean:
+            lines[0] += f"（你说的「{clean}」）"
+        if mode != "none" and isinstance(placed_x, (int, float)):
+            lines.append(f"贴在现有零件上，坐标 ({placed_x:g}, {placed_y:g})")
+        gap = detail.get("gap")
+        if isinstance(gap, (int, float)) and gap > 0.6:
+            lines.append(f"不过两面还有 {gap:.1f} 米的缝，可能没贴严")
+
+        total = build.get("part_count")
+        bodies = build.get("bodies")
+        loose = build.get("loose_parts")
+        if isinstance(total, int):
+            lines.append(f"现在共 {total} 个零件")
+        if isinstance(bodies, int) and bodies >= 1:
+            if isinstance(loose, int) and loose > 0:
+                lines.append(f"零件分成 {bodies} 块、{loose} 个悬空，还得接着补")
+            else:
+                lines.append("全部连成一体")
+
         return {
             "output": {
                 "ok": True,
-                "message": f"已把「{clean}」放到 ({x:.1f}, {y:.1f})。",
-                "placed": detail.get("placed", 0),
+                "part": part_name,
+                "stack": mode,
+                "x": placed_x,
+                "y": placed_y,
+                "gap": gap,
+                "part_count": total,
+                "bodies": bodies,
+                "loose_parts": loose,
+                "message": "；".join(lines) + "。",
                 "guide": _UI_AGENT_GUIDE,
             },
             "is_error": False,
@@ -2408,6 +2620,8 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "**引擎不会因为油门打开就点火** —— 用户说「点了没反应」「推力是 0」时，"
             "先 get_sfs_status 看 propulsion.engines_on，是 0 就发 ignite。"
             "stage 等于执行下一级（跟回车等价）；"
+            "engine_on 直接点燃所有引擎（绕过分级程序），"
+            "对程序化搭建、没有分级程序的火箭，ignite 无效时用它。"
             "要转向或平移请改用 press_sfs_key 按住 Q/E/W/A/S/D。"
         ),
         parameters={
@@ -2422,6 +2636,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                         "ignite",
                         "stage",
                         "staging_program",
+                        "engine_on",
                         "rcs_on",
                         "rcs_off",
                         "rcs_toggle",
@@ -2449,6 +2664,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "ignite",
             "stage",
             "staging_program",
+            "engine_on",
             "rcs_on",
             "rcs_off",
             "rcs_toggle",
@@ -2474,6 +2690,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "ignite": "已点火（回车 / 分级程序）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
+            "engine_on": "已直接点燃所有引擎（绕过分级程序）",
             "rcs_on": "已打开 RCS",
             "rcs_off": "已关闭 RCS",
             "rcs_toggle": "已切换 RCS 开关",

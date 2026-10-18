@@ -132,7 +132,7 @@ pwsh -File build.ps1
 
 支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、
 `ignite`（**点火**，等价于按回车）、`stage`（执行下一级）、
-`staging_program`（执行分级控制程序）、`rcs_on`、`rcs_off`、`rcs_toggle`。
+`staging_program`（执行分级控制程序）、`engine_on`（直接点燃所有引擎）、`rcs_on`、`rcs_off`、`rcs_toggle`。
 
 常用按键（`press_sfs_key` 的 `vk`）：空格=32 回车=13 Esc=27
 Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
@@ -152,7 +152,7 @@ Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
 - **动力**：`推力 120.0 kN；推重比 0.14；引擎 1/1 台点火；燃料 100%；比冲 240 秒`
   （液体燃料来自 `Rocket.resources`，固体助推器来自 `BoosterModule`）
 
-`propulsion.engines_on = 0` 时会明确提示「按回车执行分级程序才会点火」，
+`propulsion.engines_on = 0` 时会明确提示先开油门闸门再 `ignite`、无效就换 `engine_on`，
 不会再让模型自己猜「引擎是不是坏了」。
 
 ## 造火箭控制台（Hosted UI）
