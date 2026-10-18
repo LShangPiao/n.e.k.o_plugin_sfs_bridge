@@ -92,9 +92,19 @@ _SFS_DOC_GAME = """【航天模拟器 Spaceflight Simulator 是什么】
 
 【分级（Staging）】
 - 零件会被归入不同的「级」，发射时逐级抛弃空燃料箱
-- 按**回车**执行分级程序（分离 + 点燃下一级）
-- 按**空格**点火 / 熄火
-- 本插件里分级数据在 /state 的 stages 字段
+- 按**回车**执行分级程序 —— **点火、分离、点燃下一级都是它**
+- 按**空格**只切换油门闸门（throttle_on），**不会点火**
+- /state 里跟这有关的是三块：
+  · stages      —— {count 总共几级, current_index 当前第几级（0 起）,
+                   current_parts 本级零件数, summary 每级明细}
+  · propulsion  —— {thrust 推力(kN), twr 推重比, engines_on 点火引擎数,
+                   engines_total 引擎总数, fuel_percent 燃料, rcs_fuel_percent,
+                   isp 比冲}
+  · throttle / throttle_on —— 油门开度、油门闸门有没有打开
+- **油门大不等于引擎点火**：throttle 只是油门开度，引擎到底烧没烧
+  看 propulsion.engines_on。engines_on = 0 时推力是 0、飞船纹丝不动，
+  这时候要**按回车**执行分级程序（点火/分离），不是继续加大油门，
+  也不是按空格 —— 空格只切油门闸门，反而会把油门关上
 
 【飞行与轨道】
 - 姿态：Q 左转 / E 右转
@@ -146,9 +156,9 @@ _SFS_DOC_TOOLS = """【工具总览：什么时候用哪个】
 
 ■ 用户说「发射」「点火」
   1. get_sfs_status 确认在飞行场景
-  2. control_sfs(set_throttle) 设油门
-  3. press_sfs_key(vk=32) 空格点火
-  4. 等几秒，再 get_sfs_status 看速度有没有涨
+  2. control_sfs(set_throttle) 设油门（油门只管推力大小，不管点不点火）
+  3. control_sfs(action=ignite) 或者 press_sfs_key(vk=13) —— **回车**才是点火/执行分级
+  4. 等几秒，再 get_sfs_status 看 speed 有没有涨、propulsion.engines_on 是不是大于 0
 
 ■ 用户说「转向」「用 RCS 平移」
   hold_sfs_key 按住 → get_sfs_status 看数据 → release_sfs_key 松开
@@ -195,8 +205,9 @@ _UI_AGENT_GUIDE = (
     "平移与俯仰：W/S/A/D（需先按 R 打开 RCS）；"
     "油门：Shift 加大 / Ctrl 减小；"
     "RCS 开关：R；"
-    "点火 / 执行下一级：空格；"
-    "分级控制程序：回车。"
+    "点火 / 分离 / 执行下一级：**回车**（SFS 里这一键叫「分级控制程序」，"
+    "实测只有它真能点着引擎）；"
+    "油门闸门开关：空格（**不点火**，拉满油门后引擎照样是熄的）。"
     "常用虚拟键码：Q=81 E=69 W=87 A=65 S=83 D=68 R=82 空格=32 回车=13 Shift=16 Ctrl=17 Esc=27。"
     "按键同样是游戏内注入，游戏不需要在前台。"
     "【持续推力要按住，别脉冲式点】"
@@ -267,6 +278,77 @@ def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(number, maximum))
 
 
+def _describe_stages(state: Dict[str, Any]) -> List[str]:
+    """分级信息。
+
+    优先读模组新给的 ``stages`` 对象（count / current_index /
+    current_parts / summary）；老版本模组只有顶层的 ``stage`` 整数。
+    """
+    stages = _as_dict(state.get("stages"))
+    count = stages.get("count")
+    if not isinstance(count, int) or count <= 0:
+        stage = state.get("stage")
+        if isinstance(stage, int) and stage >= 0:
+            return [f"当前分级 {stage}"]
+        return []
+
+    bits: List[str] = [f"共 {count} 级"]
+    index = stages.get("current_index")
+    current_parts = stages.get("current_parts")
+    if isinstance(index, int) and index >= 0:
+        label = f"当前第 {index + 1} 级"
+        if isinstance(current_parts, int) and current_parts > 0:
+            label += f"（{current_parts} 件）"
+        bits.append(label)
+    summary = _as_text(stages.get("summary"))
+    if summary:
+        bits.append(f"明细 {summary}")
+    return ["分级：" + "；".join(bits)]
+
+
+def _describe_propulsion(state: Dict[str, Any]) -> List[str]:
+    """推力 / 推重比 / 点火引擎数 / 燃料。
+
+    模组没给 ``propulsion`` 时返回空列表（老版本模组）。
+    """
+    prop = _as_dict(state.get("propulsion"))
+    if not prop:
+        return []
+
+    bits: List[str] = []
+
+    thrust = prop.get("thrust")
+    if isinstance(thrust, (int, float)):
+        bits.append(f"推力 {thrust:.1f} kN")
+
+    twr = prop.get("twr")
+    if isinstance(twr, (int, float)) and twr > 0:
+        bits.append(f"推重比 {twr:.2f}")
+
+    total = prop.get("engines_total")
+    on = prop.get("engines_on")
+    if isinstance(total, int) and total > 0:
+        lit = on if isinstance(on, int) else 0
+        text = f"引擎 {lit}/{total} 台点火"
+        if lit == 0:
+            text += "（全都熄着：按回车执行分级程序才会点火，空格只是油门开关）"
+        bits.append(text)
+
+    fuel = prop.get("fuel_percent")
+    if isinstance(fuel, (int, float)):
+        bits.append(f"燃料 {fuel * 100:.0f}%")
+
+    rcs = prop.get("rcs_fuel_percent")
+    if isinstance(rcs, (int, float)):
+        bits.append(f"RCS 燃料 {rcs * 100:.0f}%")
+
+    isp = prop.get("isp")
+    if isinstance(isp, (int, float)) and isp > 0:
+        bits.append(f"比冲 {isp:.0f} 秒")
+
+    return ["动力：" + "；".join(bits)] if bits else []
+
+
 def _describe_state(state: Dict[str, Any]) -> str:
     """把遥测数据转成一句中文描述。"""
     if not state.get("in_world"):
@@ -290,11 +372,13 @@ def _describe_state(state: Dict[str, Any]) -> str:
 
     throttle = state.get("throttle")
     if isinstance(throttle, (int, float)):
-        parts.append(f"油门 {throttle * 100:.0f}%")
+        text = f"油门 {throttle * 100:.0f}%"
+        if "throttle_on" in state and not _as_bool(state.get("throttle_on")):
+            text += "（油门闸门关着）"
+        parts.append(text)
 
-    stage = state.get("stage")
-    if isinstance(stage, int) and stage >= 0:
-        parts.append(f"当前分级 {stage}")
+    parts.extend(_describe_stages(state))
+    parts.extend(_describe_propulsion(state))
 
     mass = state.get("mass")
     if isinstance(mass, (int, float)) and mass:
@@ -876,9 +960,10 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
         name="控制航天模拟器",
         description=(
             "向游戏发送控制指令。支持：set_throttle（设置油门 0-1）、"
-            "throttle_on、throttle_off、stage（空格：执行下一级）、"
-            "staging_program（回车：分级控制程序）、rcs_on、rcs_off、rcs_toggle。"
-            "这些指令直接改游戏状态，不经过键盘。"
+            "throttle_on / throttle_off（油门闸门开关）、"
+            "ignite（**点火**，等价于按回车）、stage（执行下一级）、"
+            "staging_program（执行分级控制程序）、rcs_on、rcs_off、rcs_toggle。"
+            "⚠️ 想点火一律用 ignite；空格只会切换油门闸门，不会点燃引擎。"
         ),
         input_schema={
             "type": "object",
@@ -889,6 +974,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                         "set_throttle",
                         "throttle_on",
                         "throttle_off",
+                        "ignite",
                         "stage",
                         "staging_program",
                         "rcs_on",
@@ -914,6 +1000,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "set_throttle",
             "throttle_on",
             "throttle_off",
+            "ignite",
             "stage",
             "staging_program",
             "rcs_on",
@@ -933,8 +1020,9 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
 
         labels = {
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
-            "throttle_on": "已点火（油门开启）",
-            "throttle_off": "已关闭油门",
+            "throttle_on": "已打开油门闸门",
+            "throttle_off": "已关闭油门闸门",
+            "ignite": "已执行点火（回车 / 分级程序）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
             "rcs_on": "已打开 RCS",
@@ -2250,7 +2338,8 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "转向 Q(81) 左 / E(69) 右；"
             "平移俯仰 W(87)/S(83)/A(65)/D(68)，需先按 R(82) 打开 RCS；"
             "油门 Shift(16) 加大 / Ctrl(17) 减小；"
-            "RCS 开关 R(82)；点火或执行下一级 空格(32)；分级控制程序 回车(13)；"
+            "RCS 开关 R(82)；**点火 / 分离 / 执行下一级 回车(13)**；"
+            "空格(32) 只是油门闸门开关，不会点火；"
             "返回菜单 Esc(27)。"
             "「按住」类操作（转向、油门）在本工具里保持约 0.12 秒，"
             "时间不够可以重复调用几次。"
@@ -2315,7 +2404,10 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "当用户要求「点火」「关油门」「油门开到 80%」「分离一级」"
             "「打开 RCS」时调用。"
             "这是会改变游戏状态的真实操作，调用前请确认用户意图明确。"
-            "注意：stage 只是执行下一级，跟空格键等价；"
+            "⚠️ 点火用 ignite（游戏里按回车）；throttle_on/off 只是油门闸门，"
+            "**引擎不会因为油门打开就点火** —— 用户说「点了没反应」「推力是 0」时，"
+            "先 get_sfs_status 看 propulsion.engines_on，是 0 就发 ignite。"
+            "stage 等于执行下一级（跟回车等价）；"
             "要转向或平移请改用 press_sfs_key 按住 Q/E/W/A/S/D。"
         ),
         parameters={
@@ -2327,6 +2419,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
                         "set_throttle",
                         "throttle_on",
                         "throttle_off",
+                        "ignite",
                         "stage",
                         "staging_program",
                         "rcs_on",
@@ -2353,6 +2446,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "set_throttle",
             "throttle_on",
             "throttle_off",
+            "ignite",
             "stage",
             "staging_program",
             "rcs_on",
@@ -2375,8 +2469,9 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
 
         labels = {
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
-            "throttle_on": "已点火",
-            "throttle_off": "已关闭油门",
+            "throttle_on": "已打开油门闸门（引擎是否点火要看 engines_on）",
+            "throttle_off": "已关闭油门闸门",
+            "ignite": "已点火（回车 / 分级程序）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
             "rcs_on": "已打开 RCS",

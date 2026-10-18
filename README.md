@@ -131,11 +131,29 @@ pwsh -File build.ps1
 | `load_sfs_blueprint` | LLM 工具 | **加载整枚蓝图**：「载入我那个 XX 火箭」 |
 
 支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、
-`stage`（空格：执行下一级）、`staging_program`（回车）、
-`rcs_on`、`rcs_off`、`rcs_toggle`。
+`ignite`（**点火**，等价于按回车）、`stage`（执行下一级）、
+`staging_program`（执行分级控制程序）、`rcs_on`、`rcs_off`、`rcs_toggle`。
 
 常用按键（`press_sfs_key` 的 `vk`）：空格=32 回车=13 Esc=27
 Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
+
+> ⚠️ **点火是回车，不是空格。** 实测 SFS 1.6.00.16：回车执行「分级控制程序」
+> （点火、分离、点燃下一级都是它），空格只切换油门闸门。以前把「点火」映射成
+> 空格，结果油门开度被反复拨动、引擎一台都没点着，用户看到的就是
+> 「油门拉满但推力 0、速度不动」。
+
+## 分级与动力遥测
+
+`get_sfs_status` 现在会读模组的 `stages` 与 `propulsion` 两块：
+
+- **分级**：`共 11 级；当前第 1 级（15 件）；明细 #1(15件) / #2(6件) / …`
+  （以前只读顶层 `stage` 整数，而模组那个字段恒为 `-1`，所以猫娘一直说
+  「收不到分级」）
+- **动力**：`推力 120.0 kN；推重比 0.14；引擎 1/1 台点火；燃料 100%；比冲 240 秒`
+  （液体燃料来自 `Rocket.resources`，固体助推器来自 `BoosterModule`）
+
+`propulsion.engines_on = 0` 时会明确提示「按回车执行分级程序才会点火」，
+不会再让模型自己猜「引擎是不是坏了」。
 
 ## 造火箭控制台（Hosted UI）
 
@@ -218,8 +236,8 @@ python -m pytest plugin/plugins/sfs_bridge/tests/test_ui_contract.py
 | 平移与俯仰（需先开 RCS） | W / A / S / D |
 | 油门加大 / 减小 | Shift / Ctrl |
 | RCS 开关 | R |
-| 点火 / 执行下一级 | 空格 |
-| 分级控制程序 | 回车 |
+| 点火 / 分离 / 执行下一级（分级程序） | 回车 |
+| 油门闸门开关（不点火） | 空格 |
 
 ## UI 操作是怎么做的
 
