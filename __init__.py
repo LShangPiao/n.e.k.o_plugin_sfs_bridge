@@ -92,7 +92,8 @@ _SFS_DOC_GAME = """【航天模拟器 Spaceflight Simulator 是什么】
 
 【分级（Staging）】
 - 零件会被归入不同的「级」，发射时逐级抛弃空燃料箱
-- 按**回车**执行分级程序 —— **点火、分离、点燃下一级都是它**
+- 按**回车**执行分级控制程序 —— **分离当前级 + 点燃下一级**（注意：它会脱离当前级，
+  想单纯点火用 control_sfs(action=ignite)，不要按回车）
 - 按**空格**只切换油门闸门（throttle_on），**不会点火**
 - /state 里跟这有关的是三块：
   · stages      —— {count 总共几级, current_index 当前第几级（0 起）,
@@ -103,8 +104,8 @@ _SFS_DOC_GAME = """【航天模拟器 Spaceflight Simulator 是什么】
   · throttle / throttle_on —— 油门开度、油门闸门有没有打开
 - **油门大不等于引擎点火**：throttle 只是油门开度，引擎到底烧没烧
   看 propulsion.engines_on。engines_on = 0 时推力是 0、飞船纹丝不动，
-  这时候要**按回车**执行分级程序（点火/分离），不是继续加大油门，
-  也不是按空格 —— 空格只切油门闸门，反而会把油门关上
+  这时候要 control_sfs(action=ignite) 直接点火，不是继续加大油门，
+  也不是按回车（回车会分离当前级）或按空格（只切油门闸门）
 
 【飞行与轨道】
 - 姿态：Q 左转 / E 右转
@@ -157,7 +158,7 @@ _SFS_DOC_TOOLS = """【工具总览：什么时候用哪个】
 ■ 用户说「发射」「点火」
   1. get_sfs_status 确认在飞行场景
   2. control_sfs(set_throttle) 设油门（油门只管推力大小，不管点不点火）
-  3. control_sfs(action=ignite) 或者 press_sfs_key(vk=13) —— **回车**才是点火/执行分级
+  3. control_sfs(action=ignite) —— 直接点燃当前级引擎（不要用回车，回车会分离当前级）
   4. 等几秒，再 get_sfs_status 看 speed 有没有涨、propulsion.engines_on 是不是大于 0
 
 ■ 用户说「转向」「用 RCS 平移」
@@ -205,8 +206,8 @@ _UI_AGENT_GUIDE = (
     "平移与俯仰：W/S/A/D（需先按 R 打开 RCS）；"
     "油门：Shift 加大 / Ctrl 减小；"
     "RCS 开关：R；"
-    "点火 / 分离 / 执行下一级：**回车**（SFS 里这一键叫「分级控制程序」，"
-    "实测只有它真能点着引擎）；"
+    "分级控制程序（分离当前级 + 点燃下一级）：回车；单纯点火用 control_sfs(ignite)，"
+    "走的是直接 EnableEngine，不碰分级，也不会分离；"
     "油门闸门开关：空格（**不点火**，拉满油门后引擎照样是熄的）。"
     "常用虚拟键码：Q=81 E=69 W=87 A=65 S=83 D=68 R=82 空格=32 回车=13 Shift=16 Ctrl=17 Esc=27。"
     "按键同样是游戏内注入，游戏不需要在前台。"
@@ -324,6 +325,9 @@ def _describe_propulsion(state: Dict[str, Any]) -> List[str]:
     twr = prop.get("twr")
     if isinstance(twr, (int, float)) and twr > 0:
         bits.append(f"推重比 {twr:.2f}")
+        on_now = prop.get("engines_on")
+        if twr < 1 and isinstance(on_now, int) and on_now > 0:
+            bits.append("推重比不到 1，抬不起来：把油门拉满或减轻重量")
 
     total = prop.get("engines_total")
     on = prop.get("engines_on")
@@ -348,6 +352,48 @@ def _describe_propulsion(state: Dict[str, Any]) -> List[str]:
         bits.append(f"比冲 {isp:.0f} 秒")
 
     return ["动力：" + "；".join(bits)] if bits else []
+
+
+_IGNITE_COMMANDS = ("ignite", "engine_on", "force_ignite")
+_READBACK_COMMANDS = _IGNITE_COMMANDS + (
+    "stage",
+    "staging_program",
+    "throttle_on",
+    "throttle_off",
+    "set_throttle",
+)
+
+
+def _bridge_error_text(result: Dict[str, Any]) -> str:
+    """把桥接返回的英文异常翻成能给用户看的中文。"""
+    raw = _as_text(result.get("error")) or _as_text(result.get("result")) or "未知错误"
+    if "no active vessel" in raw:
+        return "现在没有正在飞的载具（可能还在建造界面或菜单里）。先点 Launch 发射，再点火。"
+    if "unknown command" in raw:
+        return f"游戏不认识这条指令：{raw}"
+    if "没找到引擎" in raw or "没有引擎" in raw:
+        return "这艘火箭上没有引擎，点火没有意义。"
+    return f"游戏返回失败：{raw}"
+
+
+def _ignite_failure(command: str, prop: Dict[str, Any]) -> str:
+    """点火类指令回读之后的判定：是不是「说点着了，其实没点着」。"""
+    if command not in _IGNITE_COMMANDS:
+        return ""
+    total = prop.get("engines_total")
+    if not isinstance(total, int) or total <= 0:
+        return "这艘火箭上没有引擎，点火没有意义。"
+    on = prop.get("engines_on")
+    lit = on if isinstance(on, int) else 0
+    if lit > 0:
+        return ""
+    thrust = prop.get("thrust")
+    thrust_text = f"{thrust:.1f} kN" if isinstance(thrust, (int, float)) else "0"
+    return (
+        f"点火没成功：引擎 0/{total} 台仍然熄着，推力 {thrust_text}。"
+        "不要对用户说已经点火了。可能原因：① 还在建造/菜单里、没有载具；"
+        "② 油门闸门关着（先 throttle_on）；③ 这枚火箭没有分级程序，改用 engine_on。"
+    )
 
 
 def _describe_state(state: Dict[str, Any]) -> str:
@@ -771,6 +817,20 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
         except ValueError:
             return {"ok": True}
 
+    async def _read_propulsion_after(self, command: str) -> Dict[str, Any]:
+        """控制类指令发完之后回读一次 /state，用真实读数说话。
+
+        桥接返回 ``ok`` 只代表「按键/调用已经发出去了」，不代表引擎真点着了。
+        不回读就会出现「猫娘说点着了、火箭却还杵在发射台」这种谎报。
+        """
+        if command not in _READBACK_COMMANDS:
+            return {}
+        try:
+            state = await self._get_json("/state")
+        except Exception:  # pragma: no cover - 桥接掉线时保持沉默
+            return {}
+        return _as_dict(_as_dict(state).get("propulsion"))
+
     async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """向游戏桥接服务发送一个带 JSON 体的 POST 请求。"""
         url = f"{self._bridge_url.rstrip('/')}{path}"
@@ -1088,11 +1148,13 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
         description=(
             "向游戏发送控制指令。支持：set_throttle（设置油门 0-1）、"
             "throttle_on / throttle_off（油门闸门开关）、"
-            "ignite（**点火**，等价于按回车）、stage（执行下一级）、"
+            "ignite（**点火**，直接点燃当前级引擎，不碰分级）、"
+            "stage（执行下一级 / 分离，等价于按回车）、"
             "staging_program（执行分级控制程序）、"
             "engine_on（**强制点燃所有引擎**，用于程序化搭建、没有分级程序的火箭）、"
             "rcs_on、rcs_off、rcs_toggle。"
-            "⚠️ 想点火一律用 ignite；空格只会切换油门闸门，不会点燃引擎。"
+            "⚠️ 想点火一律用 ignite；空格只会切换油门闸门，不会点燃引擎；"
+            "回车（stage）会分离当前级，别拿它点火。"
             "⚠️ 如果 ignite 之后推力仍然是 0，改用 engine_on。"
         ),
         input_schema={
@@ -1150,11 +1212,15 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             self.logger.exception("发送指令时出错")
             return Err(SdkError(f"发送指令失败：{exc}"))
 
+        bridge = _as_dict(result)
+        if bridge.get("ok") is False:
+            return Err(SdkError(_bridge_error_text(bridge)))
+
         labels = {
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
             "throttle_on": "已打开油门闸门",
             "throttle_off": "已关闭油门闸门",
-            "ignite": "已执行点火（回车 / 分级程序）",
+            "ignite": "已点火（直接点燃当前级引擎）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
             "engine_on": "已直接点燃所有引擎（绕过分级程序）",
@@ -1162,11 +1228,26 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "rcs_off": "已关闭 RCS",
             "rcs_toggle": "已切换 RCS 开关",
         }
-        return Ok({
+
+        # 点火类指令必须回读真实读数：桥接返回 ok 只代表「按键/调用发出去了」，
+        # 不代表引擎真的点着。不回读就会出现「猫娘说点着了、火箭却还杵在发射台」。
+        prop = await self._read_propulsion_after(command)
+        if prop:
+            bad = _ignite_failure(command, prop)
+            if bad:
+                return Err(SdkError(bad))
+
+        payload = {
             "ok": bool(_as_dict(result).get("ok", True)),
             "command": command,
             "message": labels.get(command, f"已发送 {command}"),
-        })
+        }
+        if prop:
+            payload["propulsion"] = prop
+            detail = "；".join(_describe_propulsion({"propulsion": prop}))
+            if detail:
+                payload["message"] = labels.get(command, f"已发送 {command}") + "；" + detail
+        return Ok(payload)
 
     @ui.action(id="sfs_screenshot", label="截图（给模型看）", tone="info", group="画面", order=20)
     @plugin_entry(
@@ -2550,7 +2631,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "转向 Q(81) 左 / E(69) 右；"
             "平移俯仰 W(87)/S(83)/A(65)/D(68)，需先按 R(82) 打开 RCS；"
             "油门 Shift(16) 加大 / Ctrl(17) 减小；"
-            "RCS 开关 R(82)；**点火 / 分离 / 执行下一级 回车(13)**；"
+            "RCS 开关 R(82)；**分级控制程序（分离+点燃下一级）回车(13)**；"
             "空格(32) 只是油门闸门开关，不会点火；"
             "返回菜单 Esc(27)。"
             "「按住」类操作（转向、油门）在本工具里保持约 0.12 秒，"
@@ -2616,12 +2697,11 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "当用户要求「点火」「关油门」「油门开到 80%」「分离一级」"
             "「打开 RCS」时调用。"
             "这是会改变游戏状态的真实操作，调用前请确认用户意图明确。"
-            "⚠️ 点火用 ignite（游戏里按回车）；throttle_on/off 只是油门闸门，"
+            "⚠️ 点火用 ignite（直接 EnableEngine，不碰分级）；throttle_on/off 只是油门闸门，"
             "**引擎不会因为油门打开就点火** —— 用户说「点了没反应」「推力是 0」时，"
             "先 get_sfs_status 看 propulsion.engines_on，是 0 就发 ignite。"
-            "stage 等于执行下一级（跟回车等价）；"
-            "engine_on 直接点燃所有引擎（绕过分级程序），"
-            "对程序化搭建、没有分级程序的火箭，ignite 无效时用它。"
+            "stage 等于执行下一级（跟回车等价，会分离当前级）；"
+            "engine_on 与 ignite 同义，直接点燃所有引擎（绕过分级程序）。"
             "要转向或平移请改用 press_sfs_key 按住 Q/E/W/A/S/D。"
         ),
         parameters={
@@ -2676,10 +2756,22 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             }
 
         try:
-            await self._post_command(command, float(value or 0.0))
+            result = await self._post_command(command, float(value or 0.0))
+        except SdkError as exc:
+            return {
+                "output": {"ok": False, "message": str(exc)},
+                "is_error": True,
+            }
         except Exception as exc:
             return {
                 "output": {"ok": False, "message": f"指令发送失败：{exc}"},
+                "is_error": True,
+            }
+
+        bridge = _as_dict(result)
+        if bridge.get("ok") is False:
+            return {
+                "output": {"ok": False, "message": _bridge_error_text(bridge)},
                 "is_error": True,
             }
 
@@ -2687,7 +2779,7 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "set_throttle": f"已把油门设为 {float(value or 0.0) * 100:.0f}%",
             "throttle_on": "已打开油门闸门（引擎是否点火要看 engines_on）",
             "throttle_off": "已关闭油门闸门",
-            "ignite": "已点火（回车 / 分级程序）",
+            "ignite": "已点火（直接点燃当前级引擎）",
             "stage": "已执行下一级（分级）",
             "staging_program": "已执行分级控制程序",
             "engine_on": "已直接点燃所有引擎（绕过分级程序）",
@@ -2695,10 +2787,26 @@ class SfsBridgePlugin(SfsUiMixin, NekoPluginBase):
             "rcs_off": "已关闭 RCS",
             "rcs_toggle": "已切换 RCS 开关",
         }
+
+        # 回读真实读数：桥接回 ok 只代表指令发出去了，不代表引擎点着了。
+        prop = await self._read_propulsion_after(command)
+        bad = _ignite_failure(command, prop) if prop else ""
+        if bad:
+            return {
+                "output": {"ok": False, "message": bad, "propulsion": prop},
+                "is_error": True,
+            }
+
+        message = labels.get(command, "指令已发送")
+        if prop:
+            detail = "；".join(_describe_propulsion({"propulsion": prop}))
+            if detail:
+                message = message + "；" + detail
         return {
             "output": {
                 "ok": True,
-                "message": labels.get(command, "指令已发送"),
+                "message": message,
+                "propulsion": prop,
                 "guide": _UI_AGENT_GUIDE,
             },
             "is_error": False,

@@ -83,6 +83,10 @@ class _Recorder:
         self.sent.append((name, value))
         return {"ok": True}
 
+    async def _read_propulsion_after(self, command: str) -> Dict[str, Any]:
+        """默认不回读（等价于桥接没有 /state）。"""
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # 分级
@@ -137,6 +141,26 @@ def test_propulsion_engines_lit_has_no_hint() -> None:
 
 def test_propulsion_missing_returns_empty() -> None:
     assert _describe_propulsion({"in_world": True}) == []
+
+
+def test_propulsion_low_twr_warns_cannot_lift() -> None:
+    # 实测踩过的坑：油门 50% 时推力只有额定的 60 t，推重比 0.7，
+    # 火箭纹丝不动。这种时候必须明说抬不起来，不能让猫娘接着喊「加推力」。
+    slow = {
+        "in_world": True,
+        "propulsion": {
+            "thrust": 588.4,
+            "twr": 0.7,
+            "engines_on": 1,
+            "engines_total": 1,
+            "fuel_percent": 1.0,
+            "isp": 240,
+        },
+    }
+    text = "".join(_describe_propulsion(slow))
+    assert "推重比 0.70" in text
+    assert "推重比不到 1" in text
+    assert "抬不起来" in text
 
 
 # ---------------------------------------------------------------------------
@@ -216,4 +240,60 @@ def test_both_entry_points_accept_engine_on() -> None:
     entry = asyncio.run(plugin.sfs_command(command="engine_on"))
     assert entry.value.get("ok") is True
     assert plugin.sent == [("engine_on", 0.0), ("engine_on", 0.0)]
+
+
+def test_ignite_failure_is_reported_not_faked() -> None:
+    """桥接回 ok 但引擎一台没点着时，必须如实报错，不能报「已点火」。"""
+    plugin = _make_plugin()
+    dark = {"engines_total": 3, "engines_on": 0, "thrust": 0.0}
+
+    async def dark_readback(command: str) -> Dict[str, Any]:
+        return dark
+
+    plugin._read_propulsion_after = dark_readback  # type: ignore[method-assign]
+
+    tool = asyncio.run(plugin.control_sfs(command="ignite"))
+    assert tool["is_error"] is True
+    assert "点火没成功" in tool["output"]["message"]
+    assert "0/3" in tool["output"]["message"]
+
+    entry = asyncio.run(plugin.sfs_command(command="ignite"))
+    assert entry.is_ok() is False
+    assert "点火没成功" in str(entry.error)
+
+
+def test_ignite_success_includes_real_thrust() -> None:
+    plugin = _make_plugin()
+    lit = {"engines_total": 1, "engines_on": 1, "thrust": 120.0, "twr": 1.62}
+
+    async def lit_readback(command: str) -> Dict[str, Any]:
+        return lit
+
+    plugin._read_propulsion_after = lit_readback  # type: ignore[method-assign]
+
+    tool = asyncio.run(plugin.control_sfs(command="ignite"))
+    assert tool["is_error"] is False
+    assert "引擎 1/1 台点火" in tool["output"]["message"]
+
+    entry = asyncio.run(plugin.sfs_command(command="ignite"))
+    assert entry.is_ok() is True
+    assert "引擎 1/1 台点火" in entry.value.get("message", "")
+
+
+def test_build_mode_error_is_translated() -> None:
+    """在建造界面点火时桥接只回 no active vessel，必须翻成人话。"""
+    plugin = _make_plugin()
+
+    async def failing_post(command: str, value: float = 0.0) -> Dict[str, Any]:
+        return {"ok": False, "error": "no active vessel"}
+
+    plugin._post_command = failing_post  # type: ignore[method-assign]
+
+    tool = asyncio.run(plugin.control_sfs(command="ignite"))
+    assert tool["is_error"] is True
+    assert "没有正在飞的载具" in tool["output"]["message"]
+
+    entry = asyncio.run(plugin.sfs_command(command="ignite"))
+    assert entry.is_ok() is False
+    assert "没有正在飞的载具" in str(entry.error)
 

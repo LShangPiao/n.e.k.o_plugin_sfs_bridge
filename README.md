@@ -131,14 +131,15 @@ pwsh -File build.ps1
 | `load_sfs_blueprint` | LLM 工具 | **加载整枚蓝图**：「载入我那个 XX 火箭」 |
 
 支持的飞行指令：`set_throttle`（0-1）、`throttle_on`、`throttle_off`、
-`ignite`（**点火**，等价于按回车）、`stage`（执行下一级）、
+`ignite`（**点火**，直接点燃当前级引擎，不碰分级）、`stage`（执行下一级 / 分离，等价于按回车）、
 `staging_program`（执行分级控制程序）、`engine_on`（直接点燃所有引擎）、`rcs_on`、`rcs_off`、`rcs_toggle`。
 
 常用按键（`press_sfs_key` 的 `vk`）：空格=32 回车=13 Esc=27
 Q=81 E=69 W=87 A=65 S=83 D=68 R=82 Shift=16 Ctrl=17。
 
-> ⚠️ **点火是回车，不是空格。** 实测 SFS 1.6.00.16：回车执行「分级控制程序」
-> （点火、分离、点燃下一级都是它），空格只切换油门闸门。以前把「点火」映射成
+> ⚠️ **点火用 `ignite`，不要按回车。** 实测 SFS 1.6.00.16：回车执行「分级控制程序」，
+> 它会**分离当前级**再点燃下一级；`ignite` 走 `EnableEngine` 并写入 `throttle_Out`，
+> 既不碰分级也不会分离。空格只切换油门闸门。以前把「点火」映射成
 > 空格，结果油门开度被反复拨动、引擎一台都没点着，用户看到的就是
 > 「油门拉满但推力 0、速度不动」。
 
@@ -236,7 +237,7 @@ python -m pytest plugin/plugins/sfs_bridge/tests/test_ui_contract.py
 | 平移与俯仰（需先开 RCS） | W / A / S / D |
 | 油门加大 / 减小 | Shift / Ctrl |
 | RCS 开关 | R |
-| 点火 / 分离 / 执行下一级（分级程序） | 回车 |
+| 分级控制程序（分离当前级 + 点燃下一级） | 回车 |
 | 油门闸门开关（不点火） | 空格 |
 
 ## UI 操作是怎么做的
